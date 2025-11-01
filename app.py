@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 
 from orchestrator import build_full_snapshot
 from config import EXPECTED_RETURN_HURDLE, MAX_NET_DEBT_TO_EBITDA
-
+from orchestrator import enrich_company_snapshot
 
 # ---------- Helpers de formato ----------
 
@@ -373,10 +373,12 @@ with tab3:
     if not rows_data:
         st.info("Primero genera datos en la pestaña '1. Screener base'.")
     else:
+        # Construimos el universo filtrado con los mismos parámetros de hurdle y leverage
         df_all = dataframe_from_rows(rows_data, hurdle_input, max_leverage)
         df_f = df_all[df_all["leverage_ok"]].copy()
 
         tickers_available = df_f["ticker"].tolist()
+
         if not tickers_available:
             st.warning("No quedan tickers válidos tras tus filtros de hurdle y deuda.")
         else:
@@ -385,18 +387,64 @@ with tab3:
                 tickers_available
             )
 
-            row_detail = df_f[df_f["ticker"] == picked].iloc[0].copy()
+            # buscamos en rows_data el snapshot 'core' ya calculado
+            base_core = next((r for r in rows_data if r["ticker"] == picked), None)
+            if base_core is None:
+                st.error("No pude encontrar datos base de ese ticker.")
+                st.stop()
 
-            # Traer las series históricas y transcript del snapshot bruto original
-            base_raw = next((r for r in rows_data if r["ticker"] == picked), None)
-            if base_raw:
-                row_detail["years"] = base_raw.get("years", [])
-                row_detail["fcf_per_share_hist"] = base_raw.get("fcf_per_share_hist", [])
-                row_detail["shares_hist"] = base_raw.get("shares_hist", [])
-                row_detail["net_debt_hist"] = base_raw.get("net_debt_hist", [])
-                row_detail["transcript_summary"] = base_raw.get(
-                    "transcript_summary",
-                    row_detail.get("transcript_summary")
-                )
+            # enriquecemos en vivo con insiders, noticias, transcript, riesgo cualitativo, etc.
+            try:
+                from orchestrator import enrich_company_snapshot
+                detailed = enrich_company_snapshot(base_core.copy())
+            except Exception as e:
+                st.error(f"No pude completar el detalle cualitativo: {e}")
+                # en caso de fallo, mostramos al menos lo cuantitativo
+                detailed = base_core.copy()
 
-            render_detail_panel(row_detail)
+            # Aseguramos que estén los campos que usa render_detail_panel
+
+            # formateo de Net Debt / EBITDA para la métrica
+            if "netDebt_to_EBITDA" in detailed:
+                ndeb = detailed["netDebt_to_EBITDA"]
+                if ndeb is None or (isinstance(ndeb, float) and math.isnan(ndeb)):
+                    detailed["netDebt_to_EBITDA_fmt"] = "—"
+                else:
+                    detailed["netDebt_to_EBITDA_fmt"] = f"{ndeb:.2f}"
+            else:
+                detailed["netDebt_to_EBITDA_fmt"] = "—"
+
+            # nos aseguramos que estas listas existan aunque la API falle
+            detailed["years"] = detailed.get("years", [])
+            detailed["fcf_per_share_hist"] = detailed.get("fcf_per_share_hist", [])
+            detailed["shares_hist"] = detailed.get("shares_hist", [])
+            detailed["net_debt_hist"] = detailed.get("net_debt_hist", [])
+
+            # también nos aseguramos de que transcript_summary exista
+            if "transcript_summary" not in detailed:
+                detailed["transcript_summary"] = "sin señales clave detectables en la última call"
+
+            # igualamos algunos nombres que usa el panel (por seguridad)
+            if "sector" not in detailed:
+                detailed["sector"] = base_core.get("sector", "—")
+            if "industry" not in detailed:
+                detailed["industry"] = base_core.get("industry", "—")
+            if "moat_flag" not in detailed:
+                detailed["moat_flag"] = base_core.get("moat_flag", "—")
+            if "insider_signal" not in detailed:
+                detailed["insider_signal"] = base_core.get("insider_signal", "neutral")
+            if "sentiment_flag" not in detailed:
+                detailed["sentiment_flag"] = base_core.get("sentiment_flag", "neutral")
+            if "sentiment_reason" not in detailed:
+                detailed["sentiment_reason"] = detailed.get("sentiment_reason", "tono mixto/sectorial")
+            if "business_summary" not in detailed:
+                detailed["business_summary"] = base_core.get("business_summary", "—")
+            if "why_it_matters" not in detailed:
+                detailed["why_it_matters"] = base_core.get("why_it_matters", "—")
+            if "core_risk_note" not in detailed:
+                detailed["core_risk_note"] = base_core.get("core_risk_note", "riesgo principal no crítico visible")
+
+            # ROE TTM ya viene como número decimal en detailed["roe_ttm"]
+            # render_detail_panel usa _fmt_pct internamente, así que estamos bien.
+
+            render_detail_panel(detailed)

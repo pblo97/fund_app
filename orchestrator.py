@@ -33,19 +33,13 @@ from text_analysis import (
 )
 
 
-def build_universe() -> List[str]:
-    """
-    1. Correr screener en NASDAQ y NYSE con filtros duros.
-    2. Unir tickers únicos.
-    3. Filtrar por ROE mínimo usando get_ratios.
-    """
+def build_universe() -> list[str]:
     base_list = []
 
     for exch in ["NASDAQ", "NYSE"]:
         chunk = run_screener_for_exchange(exch)
         base_list.extend(chunk)
 
-    # remover duplicados por símbolo
     seen = {}
     for row in base_list:
         sym = row.get("symbol")
@@ -54,40 +48,34 @@ def build_universe() -> List[str]:
 
     tickers = list(seen.keys())
 
-    # ahora filtramos por ROE
     filtered_tickers = []
+
     for t in tickers:
         try:
             ratios_hist = get_ratios(t)
             roe_ttm = extract_roe_ttm(ratios_hist)
             if roe_ttm is None or roe_ttm < MIN_ROE_TTM:
                 continue
-            filtered_tickers.append(t)
+            filtered_tickers.append((t, roe_ttm))
         except Exception:
-            # si falla ratios, lo saltamos
             continue
 
-    return filtered_tickers
+    # 🔥 NUEVO: priorizar las mejores empresas primero
+    # ordenamos por ROE descendente y nos quedamos con las 30 mejores
+    filtered_tickers.sort(key=lambda x: (x[1] if x[1] is not None else 0), reverse=True)
+    top_symbols = [t for (t, _) in filtered_tickers[:30]]
 
+    return top_symbols
 
-def build_company_snapshot(ticker: str) -> Dict[str, Any]:
-    """
-    Para un ticker:
-    - descargar profile, income, balance, cash, ratios, insiders, news, transcript
-    - calcular métricas cuantitativas
-    - calcular señales cualitativas
-    - devolver dict final listo para mostrar en Streamlit
-    """
+# en orchestrator.py
+
+def build_company_core_snapshot(ticker: str) -> dict:
     profile = get_profile(ticker)
     income_hist = get_income_statement(ticker)
     balance_hist = get_balance_sheet(ticker)
     cash_hist = get_cash_flow(ticker)
     ratios_hist = get_ratios(ticker)
-    insider_trades = get_insider_trading(ticker)
-    news_list = get_news(ticker)
-    transcripts = get_earnings_call_transcript(ticker)
 
-    # sanity básico: necesitamos historial suficiente
     if len(income_hist) < 3 or len(balance_hist) < 3 or len(cash_hist) < 3:
         raise ValueError("historial financiero insuficiente")
 
@@ -100,56 +88,61 @@ def build_company_snapshot(ticker: str) -> Dict[str, Any]:
         cash_hist=cash_hist
     )
 
-    # insiders
-    insider_signal = summarize_insiders(insider_trades)
-
-    # news sentiment
-    sentiment_flag, sentiment_reason = summarize_news_sentiment(news_list)
-
-    # transcript summary
-    transcript_summary = summarize_transcript(transcripts)
-
-    # why it matters / riesgo
-    why_matters = infer_why_it_matters(
-        sector=base_metrics["sector"],
-        industry=base_metrics["industry"],
-        moat_flag=base_metrics["moat_flag"],
-        beta=base_metrics["beta"]
-    )
-
-    core_risk = infer_core_risk(
-        net_debt_to_ebitda=base_metrics["netDebt_to_EBITDA"],
-        sentiment_flag=sentiment_flag,
-        sentiment_reason=sentiment_reason
-    )
-
-    # completar snapshot
-    base_metrics["insider_signal"] = insider_signal
-    base_metrics["sentiment_flag"] = sentiment_flag
-    base_metrics["sentiment_reason"] = sentiment_reason
-    base_metrics["why_it_matters"] = why_matters
-    base_metrics["core_risk_note"] = core_risk
-    base_metrics["transcript_summary"] = transcript_summary
-
+    # todavía sin insiders/news/transcript
     return base_metrics
 
 
-def build_full_snapshot() -> List[Dict[str, Any]]:
-    """
-    Orquesta todo:
-    - arma universo limpio
-    - para cada ticker baja la foto completa
-    - guarda cada snapshot en una lista (aún sin persistir)
-    """
-    final_rows: List[Dict[str, Any]] = []
-    universe = build_universe()
+def enrich_company_snapshot(snapshot: dict) -> dict:
+    ticker = snapshot["ticker"]
+
+    insider_trades = get_insider_trading(ticker)
+    news_list = get_news(ticker)
+    transcripts = get_earnings_call_transcript(ticker)
+
+    from text_analysis import (
+        summarize_insiders,
+        summarize_news_sentiment,
+        summarize_transcript,
+        infer_core_risk,
+        infer_why_it_matters,
+    )
+
+    insider_signal = summarize_insiders(insider_trades)
+    sentiment_flag, sentiment_reason = summarize_news_sentiment(news_list)
+    transcript_summary = summarize_transcript(transcripts)
+    why_matters = infer_why_it_matters(
+        sector=snapshot["sector"],
+        industry=snapshot["industry"],
+        moat_flag=snapshot["moat_flag"],
+        beta=snapshot["beta"],
+    )
+    core_risk = infer_core_risk(
+        net_debt_to_ebitda=snapshot["netDebt_to_EBITDA"],
+        sentiment_flag=sentiment_flag,
+        sentiment_reason=sentiment_reason,
+    )
+
+    snapshot["insider_signal"] = insider_signal
+    snapshot["sentiment_flag"] = sentiment_flag
+    snapshot["sentiment_reason"] = sentiment_reason
+    snapshot["why_it_matters"] = why_matters
+    snapshot["core_risk_note"] = core_risk
+    snapshot["transcript_summary"] = transcript_summary
+
+    return snapshot
+
+
+
+def build_full_snapshot() -> list[dict]:
+    final_rows = []
+    universe = build_universe()  # ahora ya viene reducido a top ~30
 
     for tkr in universe:
         try:
-            snap = build_company_snapshot(tkr)
-            final_rows.append(snap)
+            snap_core = build_company_core_snapshot(tkr)
+            # sin enrich todavía
+            final_rows.append(snap_core)
         except Exception:
-            traceback.print_exc()
             continue
 
     return final_rows
