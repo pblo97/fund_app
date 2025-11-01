@@ -11,9 +11,9 @@ from orchestrator import (
     enrich_company_snapshot,
 )
 
-# -----------------------------------------------------------------------------
-# Helpers de formato (porcentaje, miles, etc.)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
+# Helpers de formato
+# -------------------------------------------------
 
 def _fmt_pct(x):
     if x is None:
@@ -55,12 +55,11 @@ def _ensure_list(v):
     return []
 
 
-# -----------------------------------------------------------------------------
-# dataframe_from_rows:
-# Toma la shortlist global (lista[dict]) y crea el DataFrame para Tab1/Tab2
-# -----------------------------------------------------------------------------
-
 def dataframe_from_rows(rows: list[dict], max_leverage: float):
+    """
+    Convierte la shortlist global (list[dict]) en un DataFrame rico,
+    con columnas formateadas y la flag de apalancamiento leverage_ok.
+    """
     df = pd.DataFrame(rows).copy()
 
     needed = [
@@ -86,8 +85,8 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         if col not in df.columns:
             df[col] = None
 
+    # leverage_ok
     def _lev_ok(x):
-        # True => pasa filtro leverage_ok
         if x is None:
             return True
         if isinstance(x, float) and math.isnan(x):
@@ -97,10 +96,9 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         except Exception:
             return True
 
-    # flag booleana para filtrar en la tabla
     df["leverage_ok"] = df["netDebt_to_EBITDA"].apply(_lev_ok)
 
-    # columnas "fmt" amigables para UI
+    # pretty columns
     df["netDebt_to_EBITDA_fmt"] = df["netDebt_to_EBITDA"].apply(
         lambda x: "—"
         if x is None or (isinstance(x, float) and math.isnan(x))
@@ -132,11 +130,11 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
     return df
 
 
-# -----------------------------------------------------------------------------
-# Panel de detalle (Tab2) con gráficos e insights cualitativos
-# -----------------------------------------------------------------------------
-
 def render_detail_panel(row: pd.Series):
+    """
+    Renderiza la ficha cualitativa + gráficos (Tab2)
+    para el ticker elegido.
+    """
     ticker = row.get("ticker", "—")
     display_name = row.get("name", row.get("companyName", ticker))
 
@@ -212,9 +210,9 @@ def render_detail_panel(row: pd.Series):
     )
 
 
-# -----------------------------------------------------------------------------
-# CONFIG DE LA PÁGINA
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
+# CONFIG STREAMLIT
+# -------------------------------------------------
 
 st.set_page_config(
     page_title="FUND Screener",
@@ -228,10 +226,6 @@ st.write(
     "2) Vemos la lista final.\n"
     "3) Abrimos una empresa y miramos insiders / news / transcript."
 )
-
-# -----------------------------------------------------------------------------
-# SIDEBAR
-# -----------------------------------------------------------------------------
 
 st.sidebar.header("Parámetros")
 
@@ -247,27 +241,25 @@ st.sidebar.markdown("---")
 run_btn = st.sidebar.button("🚀 Run Screening / Refresh Data")
 
 
-# -----------------------------------------------------------------------------
-# SESIONES
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
+# SESSION STATE
+# -------------------------------------------------
 
-# snapshot_rows = shortlist global del mercado para Tab1/Tab2
 if "snapshot_rows" not in st.session_state:
+    # shortlist global del mercado (Tab1/Tab2)
     st.session_state["snapshot_rows"] = []
 
-# last_error para mostrar si algo falló en el botón
 if "last_error" not in st.session_state:
     st.session_state["last_error"] = None
 
-# kept = tickers elegidos manualmente afuera de esta app (por ti)
-# lo usamos para la tabla "watchlist enriquecida" inmediata al inicio
 if "kept" not in st.session_state:
+    # tu watchlist manual
     st.session_state["kept"] = pd.DataFrame(columns=["symbol"])
 
 
-# -----------------------------------------------------------------------------
-# WATCHLIST ENRIQUECIDA (arriba)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
+# WATCHLIST ENRIQUECIDA (arriba de todo)
+# -------------------------------------------------
 
 kept_syms = (
     st.session_state["kept"]["symbol"]
@@ -294,6 +286,7 @@ if not final_df_watchlist.empty:
         "symbol",
         "companyName",
         "sector",
+        "industry",
         "marketCap",
         "fcf_per_share_slope_5y",
         "buyback_pct_5y",
@@ -311,13 +304,13 @@ else:
     st.info("Aún no hay watchlist enriquecida (no hay 'kept_syms').")
 
 
-# -----------------------------------------------------------------------------
-# CLICK BOTÓN: generar shortlist de mercado
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
+# BOTÓN: construir shortlist global de mercado
+# -------------------------------------------------
 
 if run_btn:
     try:
-        rows = build_market_snapshot()  # <- NUEVA función del orchestrator
+        rows = build_market_snapshot()  # <- ahora sí existe en orchestrator.py
         st.session_state["snapshot_rows"] = rows
         st.session_state["last_error"] = None
     except Exception as e:
@@ -326,7 +319,7 @@ if run_btn:
 
 rows_data = st.session_state["snapshot_rows"]
 
-# panel chico debug en sidebar:
+# feedback lateral
 if st.session_state["last_error"]:
     st.sidebar.error(f"Error al armar shortlist: {st.session_state['last_error']}")
 else:
@@ -335,18 +328,16 @@ else:
     )
 
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
 # TABS
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
 
 tab1, tab2 = st.tabs([
     "1. Shortlist final",
     "2. Detalle Ticker"
 ])
 
-# =========================
-# TAB 1
-# =========================
+# ---- TAB 1 ----
 with tab1:
     st.subheader("1. Shortlist: large caps sólidas + crecimiento compuesto ≥15%")
 
@@ -404,9 +395,7 @@ with tab1:
             "- Net Debt/EBITDA bajo = resiliencia en estrés de liquidez."
         )
 
-# =========================
-# TAB 2
-# =========================
+# ---- TAB 2 ----
 with tab2:
     st.subheader("2. Ficha detallada de la empresa")
 
@@ -426,42 +415,34 @@ with tab2:
                 tickers_available
             )
 
-            # base_core = dict de ese ticker dentro de rows_data
+            # buscar el dict original de ese ticker en rows_data
             base_core = next((r for r in rows_data if r.get("ticker") == picked), None)
             if base_core is None:
                 st.error("No encontré datos base de ese ticker.")
                 st.stop()
 
-            # enriquecemos SOLO ese ticker (insiders, news, históricos para gráficos)
             try:
                 detailed = enrich_company_snapshot(base_core.copy())
             except Exception as e:
                 st.error(f"No pude completar el detalle cualitativo: {e}")
                 detailed = base_core.copy()
 
-            # normalizamos campos que el panel espera
+            # normalizamos llaves esperadas
             nde = detailed.get("netDebt_to_EBITDA")
             if nde is None or (isinstance(nde, float) and math.isnan(nde)):
-                detailed["netDebt_to_EBITDA"] = None  # para el metric final
+                detailed["netDebt_to_EBITDA"] = None
 
-            # asegurar llaves que usa render_detail_panel()
             defaults_needed = {
                 "transcript_summary": "Sin señales fuertes en la última call.",
                 "sector": base_core.get("sector", "—"),
                 "industry": base_core.get("industry", "—"),
                 "moat_flag": base_core.get("moat_flag", "—"),
-                "insider_signal": base_core.get("insider_signal", "neutral"),
-                "sentiment_flag": base_core.get("sentiment_flag", "neutral"),
-                "sentiment_reason": base_core.get(
-                    "sentiment_reason",
-                    "tono mixto/sectorial"
-                ),
+                "insider_signal": detailed.get("insider_signal", "neutral"),
+                "sentiment_flag": detailed.get("sentiment_flag", "neutral"),
+                "sentiment_reason": detailed.get("sentiment_reason", "tono mixto/sectorial"),
                 "business_summary": base_core.get("business_summary", "—"),
                 "why_it_matters": base_core.get("why_it_matters", "—"),
-                "core_risk_note": base_core.get(
-                    "core_risk_note",
-                    "riesgo principal no crítico visible"
-                ),
+                "core_risk_note": base_core.get("core_risk_note", "riesgo principal no crítico visible"),
                 "years": detailed.get("years", []),
                 "fcf_per_share_hist": detailed.get("fcf_per_share_hist", []),
                 "shares_hist": detailed.get("shares_hist", []),
