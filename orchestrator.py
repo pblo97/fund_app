@@ -449,14 +449,12 @@ def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
 def build_market_snapshot(limit: int = 40) -> List[Dict[str, Any]]:
     """
     Construye la shortlist global (lo que Tab1 y Tab2 usan).
-    Pasos:
-    - Toma universo large cap
-    - Itera hasta 'limit' tickers
-    - Saca métricas core
-    - Inserta placeholders de growth/calidad
-    - Filtra por apalancamiento
-    Devuelve list[dict] (cada dict es una empresa).
+    Ahora además mezcla:
+    - snapshot core (P&L, balance, ratios)
+    - bloque fundamentals (FCF/acción slope, recompras, deuda, etc.)
+    y luego mete los placeholders de growth/Altman/etc.
     """
+
     uni = build_universe()
 
     tickers = (
@@ -467,22 +465,48 @@ def build_market_snapshot(limit: int = 40) -> List[Dict[str, Any]]:
         .tolist()
     )
 
-    # limitamos para no bombardear la API con cientos de tickers de una
-    tickers = tickers[:limit]
+    tickers = tickers[:limit]  # puedes subir/eliminar este límite
 
     rows_raw: List[Dict[str, Any]] = []
+
     for tkr in tickers:
         try:
+            # métrica core (income/balance/cash/ratios)
             core = build_company_core_snapshot(tkr)
         except Exception:
-            # si algo falla con ese ticker, seguimos con los demás
+            # si ni siquiera podemos sacar los básicos, saltamos este ticker
             continue
-        rows_raw.append(core)
 
-    # agrega llaves placeholder como altmanZScore, growth, etc.
+        # tratamos también de sacar fundamentals "anualizados"
+        # (fcf_per_share_slope_5y, recompras, deuda neta, etc.)
+        try:
+            fblock = fetch_fundamentals_for_symbol(tkr)
+        except Exception:
+            fblock = {
+                "fcf_per_share_slope_5y": None,
+                "buyback_pct_5y": None,
+                "net_debt_change_5y": None,
+                "net_debt_to_ebitda_last": None,
+            }
+
+        # mergeamos ambos dicts
+        merged = dict(core)
+        merged.update(fblock)
+
+        # aseguramos campos que tu UI usa con nombres consistentes
+        # ticker vs symbol
+        if "ticker" not in merged and "symbol" in merged:
+            merged["ticker"] = merged["symbol"]
+        if "symbol" not in merged and "ticker" in merged:
+            merged["symbol"] = merged["ticker"]
+
+        # agregamos a rows_raw
+        rows_raw.append(merged)
+
+    # ahora metemos placeholders tipo altmanZScore, growth, CAGR, etc.
     rows_enriched = _merge_scores_and_growth(rows_raw)
 
-    # filtro calidad base (apalancamiento razonable)
+    # filtramos apalancamiento
     final_rows = [r for r in rows_enriched if _quality_filter_final(r)]
 
     return final_rows
