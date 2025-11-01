@@ -209,11 +209,28 @@ run_btn = st.sidebar.button("🚀 Run Screening / Refresh Data")
 if "snapshot_rows" not in st.session_state:
     st.session_state["snapshot_rows"] = []
 
+if "last_error" not in st.session_state:
+    st.session_state["last_error"] = None
+
 if run_btn:
-    rows = build_full_snapshot()
-    st.session_state["snapshot_rows"] = rows
+    with st.spinner("Generando shortlist..."):
+        try:
+            rows = build_full_snapshot()
+            st.session_state["snapshot_rows"] = rows
+            st.session_state["last_error"] = None
+        except Exception as e:
+            # guardamos el error para verlo en la UI
+            st.session_state["last_error"] = str(e)
+            st.session_state["snapshot_rows"] = []
 
 rows_data = st.session_state["snapshot_rows"]
+
+# debug panel chico en el sidebar:
+if st.session_state["last_error"]:
+    st.sidebar.error(f"Error al armar shortlist: {st.session_state['last_error']}")
+else:
+    st.sidebar.success(f"{len(rows_data)} tickers cargados" if rows_data else "Sin datos aún")
+
 
 tab1, tab2 = st.tabs([
     "1. Shortlist final",

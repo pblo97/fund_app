@@ -1,147 +1,174 @@
 # orchestrator.py
 #
-# NUEVA VERSIÓN:
-# - Arma universo solo con large caps (>=10B) desde NASDAQ/NYSE/AMEX.
-# - Filtra por solvencia/calidad (Altman Z alto, Piotroski alto).
-# - Filtra por crecimiento sano (ventas, EBIT, FCF, OCF creciendo; deuda no subiendo)
-#   y CAGR >= 15% anual compuesto (3y/5y) en revenue/OCF por acción.
+# Flujo:
+# 1. build_universe() -> shortlist de tickers grandes y sanos
+#    (usa screener + filtros básicos en memoria, sin NLP ni news)
 #
-# - SOLO para esa shortlist final:
-#   descarga perfil, estados financieros, ratios
-#   y construye métricas core (aún sin insiders/news/transcripts).
+# 2. build_company_core_snapshot(ticker) -> métricas fundamentales core
 #
-# - Devuelve snapshots listos para mostrar en la app.
+# 3. build_full_snapshot() -> corre todo eso sobre la shortlist y devuelve
+#    un array de dicts listo para usar en la tabla del Tab1.
 #
-# NOTA: Puedes después, bajo demanda (por ticker clickeado), llamar enrich_company_snapshot()
-# para insiders/news/transcript y análisis cualitativo.
+# 4. enrich_company_snapshot(snapshot) -> agrega insiders, news, transcript
+#    SOLO para un ticker puntual (Tab2).
+#
 
 from typing import List, Dict, Any
-import traceback
-import pandas as pd
+import math
 
 from fmp_api import (
     run_screener_for_exchange,
-    get_financial_scores_batch,
-    get_growth_batch,
-    get_ratios,
+    get_profile,
     get_income_statement,
     get_balance_sheet,
     get_cash_flow,
-    get_profile,
+    get_ratios,
     get_insider_trading,
     get_news,
     get_earnings_call_transcript,
 )
+
 from metrics import compute_core_financial_metrics
-from text_analysis import (
-    summarize_insiders,
-    summarize_news_sentiment,
-    summarize_transcript,
-    infer_core_risk,
-    infer_why_it_matters,
-)
+from config import MAX_NET_DEBT_TO_EBITDA
 
+# -----------------------
+# Helpers internos
+# -----------------------
 
-# -------------------------------------------------
-# 1. Construir universo filtrado (large cap + calidad + crecimiento)
-# -------------------------------------------------
-
-def build_universe_pipeline() -> pd.DataFrame:
+def _is_large_cap(row: Dict[str, Any], min_mktcap: float = 10_000_000_000) -> bool:
     """
-    Paso 1: screener por exchange (ya filtra large caps >=10B en fmp_api.run_screener_for_exchange)
-    Paso 2: Financial Scores (Altman Z >=3, Piotroski >=7)
-    Paso 3: Growth sano, deuda controlada, CAGR >=15% (get_growth_batch)
+    Filtro de tamaño: nos quedamos con large caps (>=10B).
+    """
+    mc = row.get("marketCap") or row.get("mktCap") or row.get("marketCapIntraday")
+    try:
+        return float(mc) >= float(min_mktcap)
+    except Exception:
+        return False
 
-    Devuelve DataFrame final_candidates con columnas combinadas:
-        symbol, companyName, sector, industry, marketCap, ...
-        altmanZScore, piotroskiScore, ...
-        revenueGrowth, operatingCashFlowGrowth, freeCashFlowGrowth,
-        debtGrowth, rev_CAGR_5y, ocf_CAGR_5y, high_growth_flag, etc.
+
+def _merge_scores_and_growth(
+    base_rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    ACA ES DONDE EN LA VERSIÓN AVANZADA METERÍAMOS:
+    - Altman Z
+    - Piotroski
+    - Growth
+    usando endpoints batch.
+
+    Para no quedarnos pegados aún (y para ver la app viva),
+    vamos a poner placeholders seguros en vez de llamar APIs extra.
     """
 
-    # --- Paso 1: screener NASDAQ/NYSE/AMEX ---
-    universes = []
-    for exch in ("NASDAQ", "NYSE", "AMEX"):
+    enriched = []
+    for row in base_rows:
+        r = dict(row)  # copia superficial
+
+        # placeholders razonables hasta que afinemos llamadas reales:
+        # los ponemos en None en vez de inventar números, para que la UI muestre "—"
+        r.setdefault("altmanZScore", None)
+        r.setdefault("piotroskiScore", None)
+
+        # crecimientos "puntuales":
+        r.setdefault("revenueGrowth", None)
+        r.setdefault("operatingCashFlowGrowth", None)
+        r.setdefault("freeCashFlowGrowth", None)
+        r.setdefault("debtGrowth", None)
+
+        # crecimientos compuestos (CAGR 3y/5y). Igual, None placeholder.
+        r.setdefault("rev_CAGR_5y", None)
+        r.setdefault("rev_CAGR_3y", None)
+        r.setdefault("ocf_CAGR_5y", None)
+        r.setdefault("ocf_CAGR_3y", None)
+
+        enriched.append(r)
+
+    return enriched
+
+
+def _quality_filter_final(d: Dict[str, Any]) -> bool:
+    """
+    Esta función decide si el ticker pasa al shortlist final.
+    Con placeholders, hacemos un filtro mínimo:
+    - Debe tener netDebt_to_EBITDA <= MAX_NET_DEBT_TO_EBITDA (si está disponible)
+    - Debe ser large cap (ya filtrado antes)
+    Más adelante, cuando tengamos Altman Z, Piotroski, growth etc.,
+    afinamos acá.
+    """
+
+    nde = d.get("netDebt_to_EBITDA")
+    if nde is not None:
         try:
-            data = run_screener_for_exchange(exch)
+            if float(nde) > float(MAX_NET_DEBT_TO_EBITDA):
+                return False
         except Exception:
-            data = []
-        if data:
-            df_part = pd.DataFrame(data)
-            universes.append(df_part)
+            pass
 
-    if not universes:
-        return pd.DataFrame()
-
-    base_universe = (
-        pd.concat(universes, ignore_index=True)
-        .drop_duplicates(subset=["symbol"])
-        .reset_index(drop=True)
-    )
-
-    # (opcional) si quieres sacar bancos/seguros porque distorsionan Piotroski/Altman:
-    # if "sector" in base_universe.columns:
-    #     base_universe = base_universe[
-    #         ~base_universe["sector"].str.contains("Financial", case=False, na=False)
-    #     ].reset_index(drop=True)
-
-    if base_universe.empty:
-        return pd.DataFrame()
-
-    # --- Paso 2: Altman Z / Piotroski ---
-    symbols_all = base_universe["symbol"].dropna().astype(str).unique().tolist()
-    scores_df = get_financial_scores_batch(symbols_all)
-
-    if scores_df.empty:
-        return pd.DataFrame()
-
-    merged_step2 = (
-        base_universe.merge(scores_df, on="symbol", how="inner")
-        .reset_index(drop=True)
-    )
-    if merged_step2.empty:
-        return pd.DataFrame()
-
-    # --- Paso 3: Growth sano + high_growth_flag (CAGR >=15%) ---
-    symbols_step2 = merged_step2["symbol"].dropna().astype(str).unique().tolist()
-    growth_df = get_growth_batch(symbols_step2)
-
-    if growth_df.empty:
-        return pd.DataFrame()
-
-    final_candidates = (
-        merged_step2.merge(growth_df, on="symbol", how="inner")
-        .reset_index(drop=True)
-    )
-
-    # final_candidates ahora es tu shortlist "de verdad":
-    # - Large cap
-    # - Solvente / contablemente sana
-    # - Creciendo ventas/EBIT/FCF/OCF
-    # - Sin expansión de deuda
-    # - CAGR >=15% en revenue/OCF por acción
-    return final_candidates
+    return True
 
 
-# -------------------------------------------------
-# 2. Snapshot financiero core por empresa
-# -------------------------------------------------
+# -----------------------
+# Paso 1: universo inicial
+# -----------------------
 
-def build_company_core_snapshot(ticker: str) -> dict:
+def build_universe() -> List[str]:
     """
-    Descarga perfil y estados financieros de 1 compañía,
-    calcula métricas core cuantitativas (apalancamiento, márgenes, etc.).
-    NOTA: no mete todavía insiders/news/transcripts.
+    Descarga screener de NASDAQ y NYSE,
+    deduplica tickers,
+    filtra large caps >=10B,
+    y devuelve la lista de tickers candidata.
     """
+
+    base_list: List[Dict[str, Any]] = []
+
+    for exch in ["NASDAQ", "NYSE"]:
+        try:
+            chunk = run_screener_for_exchange(exch)
+            if isinstance(chunk, list):
+                base_list.extend(chunk)
+        except Exception:
+            # si falla un exchange igual seguimos con el otro
+            continue
+
+    # dedupe
+    seen: Dict[str, Dict[str, Any]] = {}
+    for row in base_list:
+        sym = row.get("symbol")
+        if sym and sym not in seen:
+            seen[sym] = row
+
+    # large caps only
+    large_caps = [
+        sym for (sym, data) in seen.items()
+        if _is_large_cap(data, min_mktcap=10_000_000_000)
+    ]
+
+    return large_caps
+
+
+# -----------------------
+# Paso 2: métricas core por empresa
+# -----------------------
+
+def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
+    """
+    Para 1 ticker:
+    - baja profile + estados financieros + ratios
+    - arma snapshot base con compute_core_financial_metrics()
+    """
+
     profile = get_profile(ticker)
     income_hist = get_income_statement(ticker)
     balance_hist = get_balance_sheet(ticker)
     cash_hist = get_cash_flow(ticker)
     ratios_hist = get_ratios(ticker)
 
-    # chequeo básico de profundidad de historial;
-    # si no hay al menos 3 períodos anuales es difícil sacar estabilidad
-    if len(income_hist) < 3 or len(balance_hist) < 3 or len(cash_hist) < 3:
+    # validación mínima para no romper más adelante
+    if (
+        not isinstance(income_hist, list) or len(income_hist) < 2 or
+        not isinstance(balance_hist, list) or len(balance_hist) < 2 or
+        not isinstance(cash_hist, list) or len(cash_hist) < 2
+    ):
         raise ValueError("historial financiero insuficiente")
 
     base_metrics = compute_core_financial_metrics(
@@ -150,120 +177,135 @@ def build_company_core_snapshot(ticker: str) -> dict:
         ratios_hist=ratios_hist,
         income_hist=income_hist,
         balance_hist=balance_hist,
-        cash_hist=cash_hist
+        cash_hist=cash_hist,
     )
 
-    # base_metrics típicamente ya incluye:
-    # - ticker, name, sector, industry
-    # - márgenes, FCF margin, ROIC, leverage, netDebt/EBITDA
-    # - moat_flag o similar si lo calculas ahí
     return base_metrics
 
 
-# -------------------------------------------------
-# 3. Enriquecer snapshot con señal cualitativa (bajo demanda)
-# -------------------------------------------------
+# -----------------------
+# Paso 3: shortlist completo
+# -----------------------
 
-def enrich_company_snapshot(snapshot: dict) -> dict:
+def build_full_snapshot() -> List[Dict[str, Any]]:
     """
-    Añade info cualitativa y de flujo reciente:
-    insiders, sentimiento de noticias, resumen de transcript de earnings,
-    'por qué importa', y el riesgo central.
-    Esto es caro en llamadas, así que úsalo solo cuando el usuario abra el detalle.
+    1. arma la lista de tickers grandes
+    2. para cada ticker, crea snapshot core
+    3. agrega placeholders de growth/scores (por ahora)
+    4. aplica quality_filter_final
+    5. retorna la lista final
     """
-    ticker = snapshot["ticker"]
 
-    insider_trades = get_insider_trading(ticker)
-    news_list = get_news(ticker)
-    transcripts = get_earnings_call_transcript(ticker)
+    final_rows: List[Dict[str, Any]] = []
 
-    insider_signal = summarize_insiders(insider_trades)
-    sentiment_flag, sentiment_reason = summarize_news_sentiment(news_list)
-    transcript_summary = summarize_transcript(transcripts)
+    tickers = build_universe()
 
-    why_matters = infer_why_it_matters(
-        sector=snapshot.get("sector"),
-        industry=snapshot.get("industry"),
-        moat_flag=snapshot.get("moat_flag"),
-        beta=snapshot.get("beta"),
+    for tkr in tickers:
+        try:
+            snap_core = build_company_core_snapshot(tkr)
+            final_rows.append(snap_core)
+        except Exception:
+            # si una empresa no tiene historia limpia, saltamos
+            continue
+
+    # Enriquecemos con placeholders de scores/growth
+    final_rows = _merge_scores_and_growth(final_rows)
+
+    # Filtro final de calidad (apalancamiento, etc.)
+    filtered_rows = [row for row in final_rows if _quality_filter_final(row)]
+
+    return filtered_rows
+
+
+# -----------------------
+# Paso 4: enrich para detalle
+# -----------------------
+
+def enrich_company_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    SOLO cuando el usuario abre el Tab2 para ver un ticker.
+    Agregamos insiders, news, transcript y hacemos inferencias cualitativas.
+    """
+
+    ticker = snapshot.get("ticker")
+
+    # llamadas adicionales (estas sí gastan créditos por ticker)
+    try:
+        insider_trades = get_insider_trading(ticker)
+    except Exception:
+        insider_trades = []
+
+    try:
+        news_list = get_news(ticker)
+    except Exception:
+        news_list = []
+
+    try:
+        transcripts = get_earnings_call_transcript(ticker)
+    except Exception:
+        transcripts = []
+
+    # ---- análisis cualitativo simple sin LLM extra ----
+    # insider_signal básico:
+    # si vemos compras ("Buy") de directores en los últimos registros -> "buy"
+    insider_signal = "neutral"
+    for it in insider_trades[:10]:
+        act = (it.get("transactionType") or "").lower()
+        if "buy" in act:
+            insider_signal = "buy"
+            break
+        if "sell" in act and insider_signal != "buy":
+            insider_signal = "sell"
+
+    # sentimiento noticias muy naive:
+    sentiment_flag = "neutral"
+    sentiment_reason = "tono mixto"
+    bad_hits = 0
+    good_hits = 0
+    from config import NEG_WORDS, POS_WORDS  # esto es seguro aquí (no circular)
+
+    for nw in news_list[:20]:
+        headline = (nw.get("title") or "").lower() + " " + (nw.get("text") or "").lower()
+        if any(w in headline for w in NEG_WORDS):
+            bad_hits += 1
+        if any(w in headline for w in POS_WORDS):
+            good_hits += 1
+
+    if bad_hits > good_hits and bad_hits > 0:
+        sentiment_flag = "neg"
+        sentiment_reason = "noticias con banderas rojas recientes"
+    elif good_hits > bad_hits and good_hits > 0:
+        sentiment_flag = "pos"
+        sentiment_reason = "tono mayormente constructivo en prensa"
+
+    # transcript_summary súper básico:
+    transcript_summary = "sin transcript reciente"
+    if transcripts:
+        first = transcripts[0]
+        # muchos endpoints de FMP devuelven 'content' o 'qa' o 'transcript'
+        transcript_summary = first.get("content") or first.get("transcript") or "call sin resumen parseable"
+
+    # riesgo cualitativo básico:
+    core_risk_note = "apalancamiento controlado"
+    nde = snapshot.get("netDebt_to_EBITDA")
+    try:
+        if nde is not None and float(nde) > float(MAX_NET_DEBT_TO_EBITDA):
+            core_risk_note = "apalancamiento elevado / riesgo de liquidez si el mercado se aprieta"
+    except Exception:
+        pass
+
+    # why_it_matters placeholder:
+    why_it_matters = (
+        f"Negocio en {snapshot.get('sector','?')} / {snapshot.get('industry','?')} "
+        f"con perfil de caja y recompras que podrían sostener composición de valor."
     )
 
-    core_risk = infer_core_risk(
-        net_debt_to_ebitda=snapshot.get("netDebt_to_EBITDA"),
-        sentiment_flag=sentiment_flag,
-        sentiment_reason=sentiment_reason,
-    )
-
+    # merge final
     snapshot["insider_signal"] = insider_signal
     snapshot["sentiment_flag"] = sentiment_flag
     snapshot["sentiment_reason"] = sentiment_reason
     snapshot["transcript_summary"] = transcript_summary
-    snapshot["why_it_matters"] = why_matters
-    snapshot["core_risk_note"] = core_risk
+    snapshot["core_risk_note"] = core_risk_note
+    snapshot["why_it_matters"] = why_it_matters
 
     return snapshot
-
-
-# -------------------------------------------------
-# 4. Construir snapshot completo para la app (solo core)
-# -------------------------------------------------
-
-def build_full_snapshot() -> List[dict]:
-    """
-    - Saca la shortlist final (large cap + calidad + crecimiento estructural).
-    - Para cada ticker en esa shortlist, baja fundamentals y arma snapshot core.
-    - NO enriquece con insiders/news/transcript para no quemar la API en masa.
-    """
-    final_rows: List[dict] = []
-
-    universe_df = build_universe_pipeline()
-    if universe_df.empty:
-        return final_rows
-
-    # la columna estándar que necesitamos es 'symbol'
-    tickers_final = (
-        universe_df["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-    for tkr in tickers_final:
-        try:
-            snap_core = build_company_core_snapshot(tkr)
-            # adjuntamos algunas columnas clave del screening (altman z, piotroski, growth)
-            row_screen = universe_df[universe_df["symbol"] == tkr].iloc[0].to_dict()
-
-            snap_core["altmanZScore"] = row_screen.get("altmanZScore")
-            snap_core["piotroskiScore"] = row_screen.get("piotroskiScore")
-            snap_core["revenueGrowth"] = row_screen.get("revenueGrowth")
-            snap_core["operatingCashFlowGrowth"] = row_screen.get("operatingCashFlowGrowth")
-            snap_core["freeCashFlowGrowth"] = row_screen.get("freeCashFlowGrowth")
-            snap_core["debtGrowth"] = row_screen.get("debtGrowth")
-            snap_core["rev_CAGR_5y"] = row_screen.get("rev_CAGR_5y")
-            snap_core["rev_CAGR_3y"] = row_screen.get("rev_CAGR_3y")
-            snap_core["ocf_CAGR_5y"] = row_screen.get("ocf_CAGR_5y")
-            snap_core["ocf_CAGR_3y"] = row_screen.get("ocf_CAGR_3y")
-            snap_core["high_growth_flag"] = row_screen.get("high_growth_flag")
-
-            final_rows.append(snap_core)
-
-        except Exception:
-            # si una empresa falla al bajar estados financieros,
-            # seguimos con las demás en vez de romper todo
-            traceback.print_exc()
-            continue
-
-    return final_rows
-
-
-# -------------------------------------------------
-# Ejecución directa para testing local
-# -------------------------------------------------
-if __name__ == "__main__":
-    rows = build_full_snapshot()
-    print(f"Tickers procesados: {len(rows)}")
-    if rows:
-        from pprint import pprint
-        pprint(rows[0])
