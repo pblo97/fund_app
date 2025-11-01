@@ -1,30 +1,19 @@
+import streamlit as st
+import pandas as pd
 import math
 import json
-import pandas as pd
 import matplotlib.pyplot as plt
-import streamlit as st
 
-# --- imports de tu capa de datos / lógica ---
-# build_full_snapshot: recibe kept_symbols -> DataFrame enriquecido con métricas históricas
-# build_market_snapshot: no recibe args -> shortlist tipo lista[dict] con Altman, Piotroski, growth, etc.
-# enrich_company_snapshot: dado un dict base de un ticker, lo enriquece con insiders / sentimiento / transcript (puede ser stub)
+from config import MAX_NET_DEBT_TO_EBITDA
 from orchestrator import (
     build_full_snapshot,
     build_market_snapshot,
     enrich_company_snapshot,
 )
 
-# --- config del umbral de leverage ---
-try:
-    from config import MAX_NET_DEBT_TO_EBITDA
-except Exception:
-    # fallback si no tienes config.py aún
-    MAX_NET_DEBT_TO_EBITDA = 2.0
-
-
-# ======================================================================================
-# Helpers de formato numérico / porcentaje / parsing
-# ======================================================================================
+# -----------------------------------------------------------------------------
+# Helpers de formato (porcentaje, miles, etc.)
+# -----------------------------------------------------------------------------
 
 def _fmt_pct(x):
     if x is None:
@@ -66,34 +55,12 @@ def _ensure_list(v):
     return []
 
 
-# ======================================================================================
-# Transformar la shortlist (list[dict]) → DataFrame listo para UI
-# ======================================================================================
+# -----------------------------------------------------------------------------
+# dataframe_from_rows:
+# Toma la shortlist global (lista[dict]) y crea el DataFrame para Tab1/Tab2
+# -----------------------------------------------------------------------------
 
 def dataframe_from_rows(rows: list[dict], max_leverage: float):
-    """
-    rows viene de build_market_snapshot() y es una lista de dicts tipo:
-    {
-        "ticker": "AAPL",
-        "name": "Apple Inc.",
-        "sector": "Technology",
-        "industry": "Consumer Electronics",
-        "marketCap": 2500000000000,
-        "altmanZScore": 8.5,
-        "piotroskiScore": 7,
-        "revenueGrowth": 0.06,
-        "operatingCashFlowGrowth": 0.08,
-        "freeCashFlowGrowth": 0.07,
-        "debtGrowth": -0.02,
-        "rev_CAGR_5y": 0.10,
-        "rev_CAGR_3y": 0.12,
-        "ocf_CAGR_5y": 0.11,
-        "ocf_CAGR_3y": 0.13,
-        "netDebt_to_EBITDA": 1.2,
-        "moat_flag": "ecosistema cerrado / marca",
-        ...
-    }
-    """
     df = pd.DataFrame(rows).copy()
 
     needed = [
@@ -120,6 +87,7 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
             df[col] = None
 
     def _lev_ok(x):
+        # True => pasa filtro leverage_ok
         if x is None:
             return True
         if isinstance(x, float) and math.isnan(x):
@@ -129,10 +97,10 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         except Exception:
             return True
 
-    # flag: ¿pasa el umbral de apalancamiento?
+    # flag booleana para filtrar en la tabla
     df["leverage_ok"] = df["netDebt_to_EBITDA"].apply(_lev_ok)
 
-    # columnas formateadas para mostrar
+    # columnas "fmt" amigables para UI
     df["netDebt_to_EBITDA_fmt"] = df["netDebt_to_EBITDA"].apply(
         lambda x: "—"
         if x is None or (isinstance(x, float) and math.isnan(x))
@@ -164,17 +132,9 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
     return df
 
 
-# ======================================================================================
-# Panel de detalle por ticker
-# ======================================================================================
-
-def _plot_safe(ax, xs, ys, xlabel, ylabel):
-    """Evita que Streamlit reviente si las listas vienen vacías o de distinto largo."""
-    if isinstance(xs, list) and isinstance(ys, list) and len(xs) == len(ys) and len(xs) > 0:
-        ax.plot(xs, ys, marker="o")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-
+# -----------------------------------------------------------------------------
+# Panel de detalle (Tab2) con gráficos e insights cualitativos
+# -----------------------------------------------------------------------------
 
 def render_detail_panel(row: pd.Series):
     ticker = row.get("ticker", "—")
@@ -224,19 +184,25 @@ def render_detail_panel(row: pd.Series):
     with colA:
         st.caption("FCF por acción")
         fig, ax = plt.subplots()
-        _plot_safe(ax, years, fcfps_hist, "Año", "FCF/acción")
+        ax.plot(years, fcfps_hist, marker="o")
+        ax.set_xlabel("Año")
+        ax.set_ylabel("FCF/acción")
         st.pyplot(fig)
 
     with colB:
         st.caption("Acciones en circulación (dilución vs recompras)")
         fig2, ax2 = plt.subplots()
-        _plot_safe(ax2, years, shares_hist, "Año", "Acciones (unidades)")
+        ax2.plot(years, shares_hist, marker="o")
+        ax2.set_xlabel("Año")
+        ax2.set_ylabel("Acciones (unidades)")
         st.pyplot(fig2)
 
     with colC:
         st.caption("Deuda Neta")
         fig3, ax3 = plt.subplots()
-        _plot_safe(ax3, years, net_debt_hist, "Año", "Deuda Neta (USD)")
+        ax3.plot(years, net_debt_hist, marker="o")
+        ax3.set_xlabel("Año")
+        ax3.set_ylabel("Deuda Neta (USD)")
         st.pyplot(fig3)
 
     st.caption(
@@ -246,9 +212,9 @@ def render_detail_panel(row: pd.Series):
     )
 
 
-# ======================================================================================
-# CONFIG DE PÁGINA
-# ======================================================================================
+# -----------------------------------------------------------------------------
+# CONFIG DE LA PÁGINA
+# -----------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="FUND Screener",
@@ -259,13 +225,13 @@ st.set_page_config(
 st.title("💸 FUND Screener")
 st.write(
     "1) Filtramos el mercado a solo large caps sanas y creciendo.\n"
-    "2) Vemos la lista final (calidad financiera + growth sostenible).\n"
-    "3) Abrimos una empresa y miramos insiders / news / transcript / tendencias históricas."
+    "2) Vemos la lista final.\n"
+    "3) Abrimos una empresa y miramos insiders / news / transcript."
 )
 
-# ======================================================================================
+# -----------------------------------------------------------------------------
 # SIDEBAR
-# ======================================================================================
+# -----------------------------------------------------------------------------
 
 st.sidebar.header("Parámetros")
 
@@ -281,45 +247,50 @@ st.sidebar.markdown("---")
 run_btn = st.sidebar.button("🚀 Run Screening / Refresh Data")
 
 
-# ======================================================================================
-# SESIÓN
-# ======================================================================================
+# -----------------------------------------------------------------------------
+# SESIONES
+# -----------------------------------------------------------------------------
 
+# snapshot_rows = shortlist global del mercado para Tab1/Tab2
 if "snapshot_rows" not in st.session_state:
     st.session_state["snapshot_rows"] = []
 
+# last_error para mostrar si algo falló en el botón
 if "last_error" not in st.session_state:
     st.session_state["last_error"] = None
 
+# kept = tickers elegidos manualmente afuera de esta app (por ti)
+# lo usamos para la tabla "watchlist enriquecida" inmediata al inicio
+if "kept" not in st.session_state:
+    st.session_state["kept"] = pd.DataFrame(columns=["symbol"])
 
-# ======================================================================================
-# BLOQUE KEPT_SYMS (lista elegida por el usuario en otra parte de la app)
-# y panel chico arriba con métricas 'compounder'
-# ======================================================================================
+
+# -----------------------------------------------------------------------------
+# WATCHLIST ENRIQUECIDA (arriba)
+# -----------------------------------------------------------------------------
 
 kept_syms = (
     st.session_state["kept"]["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+      .dropna()
+      .astype(str)
+      .unique()
+      .tolist()
     if ("kept" in st.session_state and not st.session_state["kept"].empty)
     else []
 )
 
-# build_full_snapshot necesita esa lista -> devuelve DF con columnas tipo:
-#   symbol, companyName, sector, marketCap,
-#   fcf_per_share_slope_5y, buyback_pct_5y,
-#   net_debt_to_ebitda_last, is_quality_compounder, ...
-try:
-    final_df = build_full_snapshot(kept_syms) if kept_syms else pd.DataFrame()
-except Exception as e:
-    st.warning(f"No pude generar la vista enriquecida de tus tickers guardados: {e}")
-    final_df = pd.DataFrame()
+if kept_syms:
+    try:
+        final_df_watchlist = build_full_snapshot(kept_syms)
+    except Exception as e:
+        final_df_watchlist = pd.DataFrame()
+        st.warning(f"No pude enriquecer tu watchlist: {e}")
+else:
+    final_df_watchlist = pd.DataFrame()
 
-if not final_df.empty:
-    st.subheader("Tu watchlist enriquecida (compounders / buybacks / deuda)")
-    cols_show = [
+if not final_df_watchlist.empty:
+    st.subheader("Watchlist enriquecida (tus tickers marcados)")
+    cols_watch = [
         "symbol",
         "companyName",
         "sector",
@@ -327,42 +298,35 @@ if not final_df.empty:
         "fcf_per_share_slope_5y",
         "buyback_pct_5y",
         "net_debt_to_ebitda_last",
-        "is_quality_compounder",
+        "is_quality_compounder"
     ]
-    cols_show = [c for c in cols_show if c in final_df.columns]
+    cols_watch = [c for c in cols_watch if c in final_df_watchlist.columns]
 
     st.dataframe(
-        final_df[cols_show].reset_index(drop=True),
+        final_df_watchlist[cols_watch].reset_index(drop=True),
         use_container_width=True,
         height=300
     )
-
-    st.caption(
-        "- fcf_per_share_slope_5y ↑: FCF por acción acelera → valor real al dueño.\n"
-        "- buyback_pct_5y ↑: recompras consistentes → menos dilución.\n"
-        "- net_debt_to_ebitda_last bajo: menos riesgo en shock de liquidez.\n"
-        "- is_quality_compounder: heurístico de 'flywheel' de caja reinvertible."
-    )
+else:
+    st.info("Aún no hay watchlist enriquecida (no hay 'kept_syms').")
 
 
-# ======================================================================================
-# RUN BUTTON: poblar shortlist completa del mercado
-# ======================================================================================
+# -----------------------------------------------------------------------------
+# CLICK BOTÓN: generar shortlist de mercado
+# -----------------------------------------------------------------------------
 
 if run_btn:
-    with st.spinner("Generando shortlist..."):
-        try:
-            rows = build_market_snapshot()
-            st.session_state["snapshot_rows"] = rows
-            st.session_state["last_error"] = None
-        except Exception as e:
-            st.session_state["last_error"] = str(e)
-            st.session_state["snapshot_rows"] = []
-
+    try:
+        rows = build_market_snapshot()  # <- NUEVA función del orchestrator
+        st.session_state["snapshot_rows"] = rows
+        st.session_state["last_error"] = None
+    except Exception as e:
+        st.session_state["last_error"] = str(e)
+        st.session_state["snapshot_rows"] = []
 
 rows_data = st.session_state["snapshot_rows"]
 
-# panel de debug en sidebar
+# panel chico debug en sidebar:
 if st.session_state["last_error"]:
     st.sidebar.error(f"Error al armar shortlist: {st.session_state['last_error']}")
 else:
@@ -371,19 +335,18 @@ else:
     )
 
 
-# ======================================================================================
-# TABS PRINCIPALES
-# ======================================================================================
+# -----------------------------------------------------------------------------
+# TABS
+# -----------------------------------------------------------------------------
 
 tab1, tab2 = st.tabs([
     "1. Shortlist final",
     "2. Detalle Ticker"
 ])
 
-
-# ------------------------------------------------------------------
-# TAB 1: tabla con filtros financieros / crecimiento
-# ------------------------------------------------------------------
+# =========================
+# TAB 1
+# =========================
 with tab1:
     st.subheader("1. Shortlist: large caps sólidas + crecimiento compuesto ≥15%")
 
@@ -393,14 +356,14 @@ with tab1:
         df_all = dataframe_from_rows(rows_data, max_leverage)
 
         st.write(
-            "Esta lista pasó (heurística inicial):\n"
+            "Esta lista pasó:\n"
             "- Cap grande (≥10B USD)\n"
             "- Altman Z sano (bajo riesgo de quiebra)\n"
             "- Piotroski alto (calidad contable / eficiencia operativa)\n"
-            "- Crecimiento positivo en ventas, OCF y FCF\n"
-            "- Deuda que NO se dispara\n"
+            "- Crecimiento positivo en ventas, EBIT, OCF y FCF\n"
+            "- Deuda sin expandirse\n"
             "- CAGR ≥15% en revenue/OCF por acción (3-5y)\n"
-            "- Apalancamiento ≤ tu umbral de Net Debt / EBITDA"
+            "- Apalancamiento dentro de tu umbral de Net Debt / EBITDA"
         )
 
         df_screen = df_all[df_all["leverage_ok"]].copy()
@@ -441,10 +404,9 @@ with tab1:
             "- Net Debt/EBITDA bajo = resiliencia en estrés de liquidez."
         )
 
-
-# ------------------------------------------------------------------
-# TAB 2: ficha cualitativa de un ticker de la shortlist
-# ------------------------------------------------------------------
+# =========================
+# TAB 2
+# =========================
 with tab2:
     st.subheader("2. Ficha detallada de la empresa")
 
@@ -464,56 +426,49 @@ with tab2:
                 tickers_available
             )
 
-            # base_core = dict original crudo para ese ticker
+            # base_core = dict de ese ticker dentro de rows_data
             base_core = next((r for r in rows_data if r.get("ticker") == picked), None)
             if base_core is None:
                 st.error("No encontré datos base de ese ticker.")
-            else:
-                try:
-                    detailed = enrich_company_snapshot(base_core.copy())
-                except Exception as e:
-                    st.error(f"No pude completar el detalle cualitativo: {e}")
-                    detailed = base_core.copy()
+                st.stop()
 
-                # asegurar campos mínimos para el panel
-                nde = detailed.get("netDebt_to_EBITDA")
-                if nde is None or (isinstance(nde, float) and math.isnan(nde)):
-                    detailed["netDebt_to_EBITDA_fmt"] = "—"
-                else:
-                    detailed["netDebt_to_EBITDA_fmt"] = f"{nde:.2f}"
+            # enriquecemos SOLO ese ticker (insiders, news, históricos para gráficos)
+            try:
+                detailed = enrich_company_snapshot(base_core.copy())
+            except Exception as e:
+                st.error(f"No pude completar el detalle cualitativo: {e}")
+                detailed = base_core.copy()
 
-                # historiales para los gráficos
-                detailed["years"] = detailed.get("years", [])
-                detailed["fcf_per_share_hist"] = detailed.get("fcf_per_share_hist", [])
-                detailed["shares_hist"] = detailed.get("shares_hist", [])
-                detailed["net_debt_hist"] = detailed.get("net_debt_hist", [])
+            # normalizamos campos que el panel espera
+            nde = detailed.get("netDebt_to_EBITDA")
+            if nde is None or (isinstance(nde, float) and math.isnan(nde)):
+                detailed["netDebt_to_EBITDA"] = None  # para el metric final
 
-                # defaults cualitativos
-                if "transcript_summary" not in detailed:
-                    detailed["transcript_summary"] = "Sin señales fuertes en la última call."
-                if "sector" not in detailed:
-                    detailed["sector"] = base_core.get("sector", "—")
-                if "industry" not in detailed:
-                    detailed["industry"] = base_core.get("industry", "—")
-                if "moat_flag" not in detailed:
-                    detailed["moat_flag"] = base_core.get("moat_flag", "—")
-                if "insider_signal" not in detailed:
-                    detailed["insider_signal"] = base_core.get("insider_signal", "neutral")
-                if "sentiment_flag" not in detailed:
-                    detailed["sentiment_flag"] = base_core.get("sentiment_flag", "neutral")
-                if "sentiment_reason" not in detailed:
-                    detailed["sentiment_reason"] = detailed.get(
-                        "sentiment_reason",
-                        "tono mixto/sectorial"
-                    )
-                if "business_summary" not in detailed:
-                    detailed["business_summary"] = base_core.get("business_summary", "—")
-                if "why_it_matters" not in detailed:
-                    detailed["why_it_matters"] = base_core.get("why_it_matters", "—")
-                if "core_risk_note" not in detailed:
-                    detailed["core_risk_note"] = base_core.get(
-                        "core_risk_note",
-                        "riesgo principal no crítico visible"
-                    )
+            # asegurar llaves que usa render_detail_panel()
+            defaults_needed = {
+                "transcript_summary": "Sin señales fuertes en la última call.",
+                "sector": base_core.get("sector", "—"),
+                "industry": base_core.get("industry", "—"),
+                "moat_flag": base_core.get("moat_flag", "—"),
+                "insider_signal": base_core.get("insider_signal", "neutral"),
+                "sentiment_flag": base_core.get("sentiment_flag", "neutral"),
+                "sentiment_reason": base_core.get(
+                    "sentiment_reason",
+                    "tono mixto/sectorial"
+                ),
+                "business_summary": base_core.get("business_summary", "—"),
+                "why_it_matters": base_core.get("why_it_matters", "—"),
+                "core_risk_note": base_core.get(
+                    "core_risk_note",
+                    "riesgo principal no crítico visible"
+                ),
+                "years": detailed.get("years", []),
+                "fcf_per_share_hist": detailed.get("fcf_per_share_hist", []),
+                "shares_hist": detailed.get("shares_hist", []),
+                "net_debt_hist": detailed.get("net_debt_hist", []),
+            }
+            for k, v in defaults_needed.items():
+                if k not in detailed:
+                    detailed[k] = v
 
-                render_detail_panel(pd.Series(detailed))
+            render_detail_panel(pd.Series(detailed))
