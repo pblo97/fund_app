@@ -417,3 +417,40 @@ def get_earnings_call_transcript(ticker: str, limit: int = 1) -> List[Dict[str, 
     return _get(f"/earning_call_transcript/{ticker}", {
         "limit": limit
     })
+
+def get_cashflow_history(symbol: str) -> pd.DataFrame:
+    data = _get(f"/cash-flow-statement/{symbol}", params={"period": "annual", "limit": 5})
+    df = pd.DataFrame(data)
+    # normalizamos nombres a los que vamos a usar
+    return df.rename(columns={
+        "date": "fiscalDate",
+        "operatingCashFlow": "operatingCashFlow",
+        "capitalExpenditure": "capitalExpenditure"
+    })[["fiscalDate", "operatingCashFlow", "capitalExpenditure"]]
+
+def get_balance_history(symbol: str) -> pd.DataFrame:
+    data = _get(f"/balance-sheet-statement/{symbol}", params={"period": "annual", "limit": 5})
+    df = pd.DataFrame(data)
+    return df.rename(columns={
+        "date": "fiscalDate",
+        "totalDebt": "totalDebt",
+        "cashAndShortTermInvestments": "cashAndShortTermInvestments"
+    })[["fiscalDate", "totalDebt", "cashAndShortTermInvestments"]]
+
+def get_income_history(symbol: str) -> pd.DataFrame:
+    data = _get(f"/income-statement/{symbol}", params={"period": "annual", "limit": 5})
+    df = pd.DataFrame(data)
+    return df.rename(columns={
+        "date": "fiscalDate",
+        "ebitda": "ebitda",
+        "revenue": "revenue"
+    })[["fiscalDate", "ebitda", "revenue"]]
+
+def get_shares_history(symbol: str) -> pd.DataFrame:
+    # FMP tiene /shares_float/{symbol} o viene en income-statement como weightedAverageShsOutDil
+    data = _get(f"/income-statement/{symbol}", params={"period": "annual", "limit": 5})
+    df = pd.DataFrame(data)
+    return df.rename(columns={
+        "date": "fiscalDate",
+        "weightedAverageShsOutDil": "sharesDiluted"
+    })[["fiscalDate", "sharesDiluted"]]
