@@ -1,95 +1,35 @@
-# orchestrator.py
-#
-# Flujo que consume la app:
-#
-# 1. build_universe()
-#    -> DataFrame con tickers large cap (NYSE/NASDAQ/AMEX).
-#
-# 2. build_company_core_snapshot(symbol)
-#    -> dict con todas las llaves que app.py espera en cada fila:
-#       identidad, deuda, buybacks, slope FCF/acción, etc.
-#       OJO: compute_core_financial_metrics() (nuevo) ya NO trae
-#       Altman Z, Piotroski, growth ni CAGR. Esos campos los
-#       rellenamos con None.
-#
-# 3. build_market_snapshot()
-#    -> recorre el universo y devuelve lista[dict] lista para Tab1.
-#
-# 4. enrich_company_snapshot(base_row)
-#    -> agrega insiders / news / transcript para Tab2.
-#
-
 from __future__ import annotations
-
 from typing import List, Dict, Any
-import math
-import numpy as np
 import pandas as pd
 
 from config import MAX_NET_DEBT_TO_EBITDA
 
-# ---- API FMP ----
+# FMP accessors que ya tienes en fmp_api.py
 from fmp_api import (
     run_screener_for_exchange,
     get_profile,
     get_income_statement,
-    get_balance_sheet,
     get_cash_flow,
+    get_balance_sheet,
     get_ratios,
-    get_cashflow_history,
-    get_balance_history,
-    get_income_history,
     get_shares_history,
     get_insider_trading,
     get_news,
     get_earnings_call_transcript,
 )
 
-# ---- NLP / heurísticas cualitativas ----
-# Hacemos el import "best-effort". Si falla, definimos dummies.
-try:
-    from text_analysis import (
-        summarize_business,
-        flag_moat,
-        summarize_transcript,
-        summarize_news_sentiment,
-        summarize_insiders,
-    )
-except Exception:
-    def summarize_business(_profile_like):
-        return ""
-
-    def flag_moat(_profile_like):
-        # si tenemos moat heurístico desde metrics igual,
-        # esto solo se usaría como fallback
-        return "—"
-
-    def summarize_transcript(_txt):
-        return ""
-
-    def summarize_news_sentiment(_news_list):
-        # devolvemos bandera neutral y mini-explicación
-        return ("neutral", "tono mixto/sectorial")
-
-    def summarize_insiders(_insider_raw):
-        # (signal, note)
-        return ("neutral", "")
-
-# ---- métricas cuantitativas core ----
-from metrics import compute_core_financial_metrics
-
-
-# =========================================================
-# Helpers internos
-# =========================================================
+from metrics import compute_core_metrics
+from text_analysis import (
+    summarize_business,
+    summarize_news_sentiment,
+    summarize_insiders,
+    summarize_transcript,
+)
 
 EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]
 
 
-def _is_large_cap(row: Dict[str, Any], min_mktcap: float = 10_000_000_000) -> bool:
-    """
-    Filtro large cap >= 10B USD.
-    """
+def _is_large_cap_row(row: Dict[str, Any], min_mktcap: float = 10_000_000_000) -> bool:
     mc = (
         row.get("marketCap")
         or row.get("mktCap")
@@ -101,430 +41,177 @@ def _is_large_cap(row: Dict[str, Any], min_mktcap: float = 10_000_000_000) -> bo
         return False
 
 
-def _linear_trend(values: pd.Series | list[float]) -> float | None:
-    """
-    Pendiente lineal (slope) sobre una serie temporal simple.
-    Devuelve None si hay <2 puntos válidos.
-    """
-    s = pd.Series(values).dropna()
-    if len(s) < 2:
-        return None
-    x = np.arange(len(s), dtype=float)
-    y = s.astype(float).values
-    slope, _ = np.polyfit(x, y, 1)
-    return float(slope)
-
-
-def _safe_div(a, b):
-    try:
-        if b is None or float(b) == 0:
-            return None
-        return float(a) / float(b)
-    except Exception:
-        return None
-
-
-def _fetch_histories(symbol: str) -> pd.DataFrame:
-    """
-    Descarga historia anual de cashflow/balance/income/shares,
-    la alinea por fiscalDate ascendente (viejo -> nuevo),
-    y deriva columnas auxiliares:
-      - fcf (OCF - CapEx)
-      - fcf_per_share
-      - net_debt
-      - ebitda
-      - sharesDiluted
-    """
-    cf = get_cashflow_history(symbol)
-    bal = get_balance_history(symbol)
-    inc = get_income_history(symbol)
-    shr = get_shares_history(symbol)
-
-    hist = (
-        pd.merge(cf, shr, on="fiscalDate", how="outer")
-          .merge(bal, on="fiscalDate", how="outer")
-          .merge(inc, on="fiscalDate", how="outer")
-    )
-
-    hist = hist.sort_values("fiscalDate").reset_index(drop=True)
-
-    # FCF y FCF/acción
-    hist["fcf"] = hist["operatingCashFlow"] - hist["capitalExpenditure"]
-    hist["fcf_per_share"] = _safe_div(hist["fcf"], hist["sharesDiluted"])
-
-    # Net Debt = totalDebt - cashAndShortTermInvestments
-    hist["net_debt"] = hist["totalDebt"] - hist["cashAndShortTermInvestments"]
-
-    return hist
-
-
-def _compute_buyback_pct_5y(hist: pd.DataFrame) -> float | None:
-    """
-    Aproximación de recompras netas:
-    (shares_start - shares_end)/shares_start.
-    """
-    if hist is None or hist.empty or "sharesDiluted" not in hist.columns:
-        return None
-    shares = hist["sharesDiluted"].dropna()
-    if len(shares) < 2:
-        return None
-    start = float(shares.iloc[0])
-    end   = float(shares.iloc[-1])
-    if start == 0:
-        return None
-    return (start - end) / start
-
-
-def _compute_net_debt_change_5y(hist: pd.DataFrame) -> float | None:
-    """
-    Cambio absoluto en deuda neta entre primer y último punto.
-    """
-    if hist is None or hist.empty or "net_debt" not in hist.columns:
-        return None
-    nd = hist["net_debt"].dropna()
-    if len(nd) < 2:
-        return None
-    return float(nd.iloc[-1]) - float(nd.iloc[0])
-
-
-def _compute_last_net_debt_to_ebitda(hist: pd.DataFrame) -> float | None:
-    """
-    Usa el último punto disponible con net_debt y ebitda.
-    """
-    if hist is None or hist.empty:
-        return None
-    last_valid = hist.dropna(subset=["net_debt", "ebitda"]).iloc[-1:]
-    if last_valid.empty:
-        return None
-    nd = last_valid["net_debt"].values[0]
-    eb = last_valid["ebitda"].values[0]
-    if eb is None or eb == 0:
-        return None
-    try:
-        return float(nd) / float(eb)
-    except Exception:
-        return None
-
-
-def _flag_positive(x):
-    """
-    True si x es numérico > 0.
-    """
-    if x is None:
-        return False
-    try:
-        return float(x) > 0
-    except Exception:
-        return False
-
-
-# =========================================================
-# Paso 1: universo inicial
-# =========================================================
-
 def build_universe() -> pd.DataFrame:
-    """
-    Descarga screener por exchange y concatena.
-    Devuelve solo large caps únicas por symbol.
-    Columnas mínimas esperadas:
-        symbol, companyName (o name), sector, industry, marketCap
-    """
     frames: List[pd.DataFrame] = []
 
     for exch in EXCHANGES:
         try:
             chunk = run_screener_for_exchange(exch)
-
-            # 1. saltar si viene vacío
-            if chunk is None:
-                continue
-
-            # 2. normalizar a DataFrame
-            #    casos posibles:
-            #    - list[dict] -> pd.DataFrame(list_of_dicts)
-            #    - dict con "data" -> usar eso si aplica
-            #    - ya es DataFrame -> lo dejamos igual
-            if isinstance(chunk, list):
-                # típico: FMP te da [ {symbol:..., ...}, {...}, ... ]
-                chunk_df = pd.DataFrame(chunk)
-            elif isinstance(chunk, dict):
-                # a veces APIs devuelven {"data":[...]} o similar.
-                if "data" in chunk and isinstance(chunk["data"], list):
-                    chunk_df = pd.DataFrame(chunk["data"])
-                else:
-                    # si es un dict suelto de una sola empresa, igual lo metemos
-                    chunk_df = pd.DataFrame([chunk])
-            elif isinstance(chunk, pd.DataFrame):
-                chunk_df = chunk
-            else:
-                # tipo raro -> lo ignoramos
-                continue
-
-            # aseguramos que exista al menos symbol para no meter basura
-            if "symbol" not in chunk_df.columns:
-                continue
-
-            frames.append(chunk_df)
-
         except Exception:
-            # si FMP falla en un exchange, seguimos con el resto
             continue
 
-    # si no hubo nada usable, devolvemos df vacío coherente
+        if chunk is None:
+            continue
+
+        # normalizar a DataFrame
+        if isinstance(chunk, list):
+            df_chunk = pd.DataFrame(chunk)
+        elif isinstance(chunk, dict):
+            if "data" in chunk and isinstance(chunk["data"], list):
+                df_chunk = pd.DataFrame(chunk["data"])
+            else:
+                df_chunk = pd.DataFrame([chunk])
+        elif isinstance(chunk, pd.DataFrame):
+            df_chunk = chunk
+        else:
+            continue
+
+        if "symbol" not in df_chunk.columns:
+            continue
+
+        frames.append(df_chunk)
+
     if not frames:
-        return pd.DataFrame(
-            columns=["symbol", "companyName", "sector", "industry", "marketCap"]
-        )
+        return pd.DataFrame(columns=["symbol","companyName","sector","industry","marketCap"])
 
-    # 3. concatenar todo
-    universe_raw = pd.concat(frames, ignore_index=True)
+    uni = pd.concat(frames, ignore_index=True)
 
-    # 4. normalizar nombres esperados
-    #    (algunas respuestas traen 'name' en vez de 'companyName')
-    if "companyName" not in universe_raw.columns and "name" in universe_raw.columns:
-        universe_raw = universe_raw.rename(columns={"name": "companyName"})
+    # renombrar name -> companyName si es necesario
+    if "companyName" not in uni.columns and "name" in uni.columns:
+        uni = uni.rename(columns={"name":"companyName"})
 
-    # si no trae marketCap directo pero trae mktCap u otro alias, hacemos fallback
-    if "marketCap" not in universe_raw.columns:
-        for alt in ["mktCap", "marketCapIntraday"]:
-            if alt in universe_raw.columns:
-                universe_raw["marketCap"] = universe_raw[alt]
+    # asegurar marketCap
+    if "marketCap" not in uni.columns:
+        for fallback in ["mktCap", "marketCapIntraday"]:
+            if fallback in uni.columns:
+                uni["marketCap"] = uni[fallback]
                 break
-        if "marketCap" not in universe_raw.columns:
-            universe_raw["marketCap"] = None
+        if "marketCap" not in uni.columns:
+            uni["marketCap"] = None
 
-    # 5. dedupe por symbol
-    universe_raw = (
-        universe_raw.drop_duplicates(subset=["symbol"])
-                    .reset_index(drop=True)
+    # limpiar duplicados
+    uni = (
+        uni
+        .drop_duplicates(subset=["symbol"])
+        .reset_index(drop=True)
     )
 
-    # 6. filtrar large caps con el helper _is_large_cap
-    mask_large = universe_raw.apply(_is_large_cap, axis=1)
-    universe_large = universe_raw[mask_large].reset_index(drop=True)
+    # filtrar large cap
+    mask_large = uni.apply(_is_large_cap_row, axis=1)
+    uni = uni[mask_large].reset_index(drop=True)
 
-    # 7. dejemos sólo columnas limpias que el resto usa
-    keep_cols = [
-        "symbol",
-        "companyName",
-        "sector",
-        "industry",
-        "marketCap",
-    ]
-    # agregamos si existen; si faltan, las creamos en blanco para no romper después
-    for col in keep_cols:
-        if col not in universe_large.columns:
-            universe_large[col] = None
+    # columnas mínimas
+    for col in ["symbol","companyName","sector","industry","marketCap"]:
+        if col not in uni.columns:
+            uni[col] = None
 
-    universe_large = universe_large[keep_cols].copy()
-
-    return universe_large
+    return uni[["symbol","companyName","sector","industry","marketCap"]].copy()
 
 
-
-# =========================================================
-# Paso 2: snapshot core por empresa
-# =========================================================
-
-def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
+def build_company_row(symbol: str) -> Dict[str, Any] | None:
     """
-    Para 1 ticker:
-    - baja info cruda de FMP
-    - llama compute_core_financial_metrics() (nuevo), que SOLO da:
-        * ticker, name, sector, industry, marketCap, beta
-        * business_summary
-        * netDebt_to_EBITDA
-        * moat_flag
-        * years / fcf_per_share_hist / shares_hist / net_debt_hist
-    - calcula buybacks, slope FCF/acción, net_debt_to_ebitda_last, etc.
-    - rellena AltmanZScore, Piotroski, growth, CAGR con None.
+    Baja toda la data cruda de FMP para un ticker,
+    llama compute_core_metrics,
+    y devuelve una fila lista para la tabla principal (Tab1),
+    más info base que Tab2 usará.
     """
-
-    # 1. bajar data cruda para compute_core_financial_metrics
     try:
-        profile_data      = get_profile(symbol)
-        income_hist_raw   = get_income_statement(symbol)
-        balance_hist_raw  = get_balance_sheet(symbol)
-        cash_hist_raw     = get_cash_flow(symbol)
-        ratios_hist_raw   = get_ratios(symbol)
+        profile      = get_profile(symbol) or {}
+        income_hist  = get_income_statement(symbol) or []
+        cash_hist    = get_cash_flow(symbol) or []
+        balance_hist = get_balance_sheet(symbol) or []
+        ratios_hist  = get_ratios(symbol) or []
+        shares_hist  = get_shares_history(symbol) or []
     except Exception:
         return None
 
-    # sanity mínima
-    if (
-        not isinstance(income_hist_raw, list) or len(income_hist_raw) < 1 or
-        not isinstance(balance_hist_raw, list) or len(balance_hist_raw) < 1 or
-        not isinstance(cash_hist_raw, list) or len(cash_hist_raw) < 1
-    ):
+    # sanity mínimo para no reventar
+    if len(income_hist) < 2 or len(cash_hist) < 2 or len(balance_hist) < 2:
         return None
 
-    # 2. métricas core básicas
-    core = compute_core_financial_metrics(
+    core = compute_core_metrics(
         ticker=symbol,
-        profile=profile_data,
-        ratios_hist=ratios_hist_raw,
-        income_hist=income_hist_raw,
-        balance_hist=balance_hist_raw,
-        cash_hist=cash_hist_raw,
+        profile=profile,
+        income_hist=income_hist,
+        cash_hist=cash_hist,
+        balance_hist=balance_hist,
+        ratios_hist=ratios_hist,
+        shares_hist=shares_hist,
     )
 
-    # 3. históricos detallados
-    hist_df = _fetch_histories(symbol)
-
-    fcf_slope_5y = None
-    buyback_pct_5y = None
-    net_debt_change_5y = None
-    net_debt_to_ebitda_last = None
-
-    # series que enviaremos al Tab2
-    years_series = core.get("years", [])
-    fcfps_series = core.get("fcf_per_share_hist", [])
-    shares_series = core.get("shares_hist", [])
-    net_debt_series = core.get("net_debt_hist", [])
-
-    if hist_df is not None and not hist_df.empty:
-        # slope FCF/acción
-        if "fcf_per_share" in hist_df.columns:
-            fcf_slope_5y = _linear_trend(hist_df["fcf_per_share"])
-
-        # recompras (% reducción acciones)
-        buyback_pct_5y = _compute_buyback_pct_5y(hist_df)
-
-        # cambio deuda neta
-        net_debt_change_5y = _compute_net_debt_change_5y(hist_df)
-
-        # último ND/EBITDA del hist real
-        net_debt_to_ebitda_last = _compute_last_net_debt_to_ebitda(hist_df)
-
-        # sobrescribimos series con hist_df cronológico limpio
-        years_series = hist_df["fiscalDate"].astype(str).tolist()
-        fcfps_series = (
-            hist_df["fcf_per_share"]
-            .astype(float)
-            .replace([np.inf, -np.inf], np.nan)
-            .tolist()
-        )
-        shares_series = (
-            hist_df["sharesDiluted"]
-            .astype(float)
-            .replace([np.inf, -np.inf], np.nan)
-            .tolist()
-        )
-        net_debt_series = (
-            hist_df["net_debt"]
-            .astype(float)
-            .replace([np.inf, -np.inf], np.nan)
-            .tolist()
-        )
-
-    # quality flag
-    flag_fcf_up = _flag_positive(fcf_slope_5y)
-    flag_buybacks = (
-        buyback_pct_5y is not None
-        and not (isinstance(buyback_pct_5y, float) and math.isnan(buyback_pct_5y))
-        and buyback_pct_5y > 0.05
-    )
-    flag_net_debt_ok = (
-        net_debt_to_ebitda_last is not None
-        and not (isinstance(net_debt_to_ebitda_last, float) and math.isnan(net_debt_to_ebitda_last))
-        and net_debt_to_ebitda_last < 2
-    )
-    is_quality_compounder = bool(flag_fcf_up and flag_buybacks and flag_net_debt_ok)
-
-    # 4. fila final con TODAS las llaves que app.py espera
+    # fila final coherente con app.py/dataframe_from_rows
     row: Dict[str, Any] = {
-        # identidad
-        "ticker":            core.get("ticker", symbol),
-        "name":              core.get("name", ""),
-        "companyName":       core.get("name", ""),
-        "sector":            core.get("sector", "—"),
-        "industry":          core.get("industry", "—"),
-        "marketCap":         core.get("marketCap"),
-        "beta":              core.get("beta"),
-        "business_summary":  core.get("business_summary", ""),
+        "ticker": core["ticker"],
+        "name": core["name"] or core["ticker"],
+        "companyName": core["name"] or core["ticker"],
+        "sector": core["sector"],
+        "industry": core["industry"],
+        "marketCap": core["marketCap"],
 
-        # scores (placeholder porque metrics nuevo no calcula esto)
-        "altmanZScore":      None,
-        "piotroskiScore":    None,
+        "altmanZScore": core["altmanZScore"],
+        "piotroskiScore": core["piotroskiScore"],
 
-        # growth / CAGR (placeholder)
-        "revenueGrowth":            None,
-        "operatingCashFlowGrowth":  None,
-        "freeCashFlowGrowth":       None,
-        "debtGrowth":               None,
-        "rev_CAGR_5y":              None,
-        "rev_CAGR_3y":              None,
-        "ocf_CAGR_5y":              None,
-        "ocf_CAGR_3y":              None,
+        "revenueGrowth": core["revenueGrowth"],
+        "operatingCashFlowGrowth": core["operatingCashFlowGrowth"],
+        "freeCashFlowGrowth": core["freeCashFlowGrowth"],
+        "debtGrowth": core["debtGrowth"],
 
-        # deuda / leverage
-        "netDebt_to_EBITDA":       core.get("netDebt_to_EBITDA"),
-        "net_debt_to_ebitda_last": net_debt_to_ebitda_last,
-        "net_debt_change_5y":      net_debt_change_5y,
+        "rev_CAGR_5y": core["rev_CAGR_5y"],
+        "ocf_CAGR_5y": core["ocf_CAGR_5y"],
 
-        # recompras / FCF/acción
-        "fcf_per_share_slope_5y":  fcf_slope_5y,
-        "buyback_pct_5y":          buyback_pct_5y,
+        "netDebt_to_EBITDA": core["netDebt_to_EBITDA"],
 
-        # moat heurístico
-        "moat_flag":               core.get("moat_flag", "—"),
+        "buyback_pct_5y": core["buyback_pct_5y"],
+        "fcf_per_share_slope_5y": core["fcf_per_share_slope_5y"],
+        "is_quality_compounder": core["is_quality_compounder"],
 
-        # flag compuesto tipo "✅ COMPOUNDER"
-        "is_quality_compounder":   is_quality_compounder,
+        "moat_flag": core["moat_flag"],
+        "business_summary": core["business_summary"],
 
-        # notas cualitativas básicas (se llenan mejor en enrich_company_snapshot)
-        "why_it_matters":          "",
-        "core_risk_note":          "",
-
-        # series históricas para Tab2
-        "years":                years_series,
-        "fcf_per_share_hist":   fcfps_series,
-        "shares_hist":          shares_series,
-        "net_debt_hist":        net_debt_series,
+        # series para el Tab2
+        "years": core["years"],
+        "fcf_per_share_hist": core["fcf_per_share_hist"],
+        "shares_hist": core["shares_hist"],
+        "net_debt_hist": core["net_debt_hist"],
     }
 
     return row
 
 
-# =========================================================
-# Paso 3: shortlist de mercado (Tab1)
-# =========================================================
-
 def build_market_snapshot() -> List[Dict[str, Any]]:
     """
-    1. arma universo large caps
-    2. corre build_company_core_snapshot() para cada symbol
-    3. devuelve lista[dict] lista para la UI
+    Arma la shortlist para Tab1.
     """
     uni = build_universe()
-    rows: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
 
-    for _idx, r in uni.iterrows():
-        sym = str(r.get("symbol"))
+    for _, r in uni.iterrows():
+        sym = str(r["symbol"])
         if not sym:
             continue
 
-        snap = build_company_core_snapshot(sym)
+        snap = build_company_row(sym)
         if snap is None:
             continue
 
-        # podríamos filtrar apalancadas acá, pero dejamos que la UI lo haga
-        rows.append(snap)
+        # filtro suave de leverage (no las boto si están pasadas,
+        # porque tú igual las filtras con el slider en la UI, pero
+        # si quisieras cortarlas acá puedes hacerlo)
+        nde = snap.get("netDebt_to_EBITDA")
+        try:
+            if nde is not None and float(nde) > float(MAX_NET_DEBT_TO_EBITDA):
+                pass  # actualmente dejamos pasar igual
+        except Exception:
+            pass
 
-    return rows
+        out.append(snap)
 
+    return out
 
-# =========================================================
-# Paso 4: enriquecimiento cualitativo (Tab2)
-# =========================================================
 
 def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Recibe la fila base y agrega:
-      - insiders
-      - sentimiento prensa
-      - resumen earnings call
-    Si text_analysis falló al importar, usamos dummies neutras.
+    Tab2: agrega insiders, news sentiment y earnings call.
     """
     symbol = base_row.get("ticker") or base_row.get("symbol")
     if not symbol:
@@ -535,29 +222,33 @@ def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
         insider_raw = get_insider_trading(symbol)
     except Exception:
         insider_raw = []
-    insider_signal, insider_note = summarize_insiders(insider_raw)
+    ins_sig, ins_note = summarize_insiders(insider_raw)
 
-    # news / sentimiento
+    # news sentiment
     try:
         news_raw = get_news(symbol)
     except Exception:
         news_raw = []
-    sentiment_flag, sentiment_reason = summarize_news_sentiment(news_raw)
+    sent_flag, sent_reason = summarize_news_sentiment(news_raw)
 
-    # earnings call transcript
+    # transcript
     try:
         transcript_txt = get_earnings_call_transcript(symbol)
     except Exception:
         transcript_txt = ""
-    transcript_summary = summarize_transcript(transcript_txt)
+    call_sum = summarize_transcript(transcript_txt)
 
     enriched = dict(base_row)
-    enriched["insider_signal"] = insider_signal or "neutral"
-    enriched["insider_note"] = insider_note or ""
-    enriched["sentiment_flag"] = sentiment_flag or "neutral"
-    enriched["sentiment_reason"] = sentiment_reason or "tono mixto/sectorial"
+    enriched["insider_signal"] = ins_sig or "neutral"
+    enriched["insider_note"] = ins_note or ""
+    enriched["sentiment_flag"] = sent_flag or "neutral"
+    enriched["sentiment_reason"] = sent_reason or "tono mixto/sectorial"
     enriched["transcript_summary"] = (
-        transcript_summary or "Sin señales fuertes en la última call."
+        call_sum or "Sin señales fuertes en la última call."
     )
+
+    # por si en algún caso base_row no traía un resumen legible
+    if not enriched.get("business_summary"):
+        enriched["business_summary"] = summarize_business({"description": base_row.get("business_summary", "")})
 
     return enriched
