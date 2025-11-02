@@ -6,10 +6,11 @@
 #    -> DataFrame con tickers large cap (NYSE/NASDAQ/AMEX).
 #
 # 2. build_company_core_snapshot(symbol)
-#    -> dict con TODAS las llaves que app.py espera en cada fila:
+#    -> dict con todas las llaves que app.py espera en cada fila:
 #       identidad, deuda, buybacks, slope FCF/acción, etc.
-#       OJO: ahora metrics.compute_core_financial_metrics() ya NO trae
-#       Altman Z, Piotroski, growth, CAGR. Esos campos los dejamos en None.
+#       OJO: compute_core_financial_metrics() (nuevo) ya NO trae
+#       Altman Z, Piotroski, growth ni CAGR. Esos campos los
+#       rellenamos con None.
 #
 # 3. build_market_snapshot()
 #    -> recorre el universo y devuelve lista[dict] lista para Tab1.
@@ -45,15 +46,36 @@ from fmp_api import (
 )
 
 # ---- NLP / heurísticas cualitativas ----
-from text_analysis import (
-    summarize_business,
-    flag_moat,
-    summarize_transcript,
-    summarize_news_sentiment,
-    summarize_insiders,
-)
+# Hacemos el import "best-effort". Si falla, definimos dummies.
+try:
+    from text_analysis import (
+        summarize_business,
+        flag_moat,
+        summarize_transcript,
+        summarize_news_sentiment,
+        summarize_insiders,
+    )
+except Exception:
+    def summarize_business(_profile_like):
+        return ""
 
-# ---- métricas core cuantitativas básicas (versión nueva sin scores/growth) ----
+    def flag_moat(_profile_like):
+        # si tenemos moat heurístico desde metrics igual,
+        # esto solo se usaría como fallback
+        return "—"
+
+    def summarize_transcript(_txt):
+        return ""
+
+    def summarize_news_sentiment(_news_list):
+        # devolvemos bandera neutral y mini-explicación
+        return ("neutral", "tono mixto/sectorial")
+
+    def summarize_insiders(_insider_raw):
+        # (signal, note)
+        return ("neutral", "")
+
+# ---- métricas cuantitativas core ----
 from metrics import compute_core_financial_metrics
 
 
@@ -246,15 +268,17 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
     """
     Para 1 ticker:
     - baja info cruda de FMP
-    - llama compute_core_financial_metrics() (la versión nueva)
-      que ahora SOLO da identidad, moat_flag, netDebt_to_EBITDA
-      y las series históricas base.
-    - calcula internamente buybacks, slope FCF/acción, etc.
-    - rellena placeholders (Altman, Piotroski, growth, CAGR) como None
-      para que app.py no rompa.
+    - llama compute_core_financial_metrics() (nuevo), que SOLO da:
+        * ticker, name, sector, industry, marketCap, beta
+        * business_summary
+        * netDebt_to_EBITDA
+        * moat_flag
+        * years / fcf_per_share_hist / shares_hist / net_debt_hist
+    - calcula buybacks, slope FCF/acción, net_debt_to_ebitda_last, etc.
+    - rellena AltmanZScore, Piotroski, growth, CAGR con None.
     """
 
-    # 1. bajar data cruda necesaria para compute_core_financial_metrics
+    # 1. bajar data cruda para compute_core_financial_metrics
     try:
         profile_data      = get_profile(symbol)
         income_hist_raw   = get_income_statement(symbol)
@@ -264,7 +288,7 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
     except Exception:
         return None
 
-    # sanity check mínima
+    # sanity mínima
     if (
         not isinstance(income_hist_raw, list) or len(income_hist_raw) < 1 or
         not isinstance(balance_hist_raw, list) or len(balance_hist_raw) < 1 or
@@ -272,7 +296,7 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
     ):
         return None
 
-    # 2. core básico (identidad, moat, netDebt_to_EBITDA, series históricas)
+    # 2. métricas core básicas
     core = compute_core_financial_metrics(
         ticker=symbol,
         profile=profile_data,
@@ -282,13 +306,15 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
         cash_hist=cash_hist_raw,
     )
 
-    # 3. históricos detallados para buybacks/slope/leverage real
+    # 3. históricos detallados
     hist_df = _fetch_histories(symbol)
 
     fcf_slope_5y = None
     buyback_pct_5y = None
     net_debt_change_5y = None
     net_debt_to_ebitda_last = None
+
+    # series que enviaremos al Tab2
     years_series = core.get("years", [])
     fcfps_series = core.get("fcf_per_share_hist", [])
     shares_series = core.get("shares_hist", [])
@@ -299,16 +325,16 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
         if "fcf_per_share" in hist_df.columns:
             fcf_slope_5y = _linear_trend(hist_df["fcf_per_share"])
 
-        # recompras
+        # recompras (% reducción acciones)
         buyback_pct_5y = _compute_buyback_pct_5y(hist_df)
 
-        # cambio deuda neta 5y
+        # cambio deuda neta
         net_debt_change_5y = _compute_net_debt_change_5y(hist_df)
 
-        # net debt / EBITDA del último año con datos válidos
+        # último ND/EBITDA del hist real
         net_debt_to_ebitda_last = _compute_last_net_debt_to_ebitda(hist_df)
 
-        # sobreescribimos series usando hist_df (que está ordenado cronológico)
+        # sobrescribimos series con hist_df cronológico limpio
         years_series = hist_df["fiscalDate"].astype(str).tolist()
         fcfps_series = (
             hist_df["fcf_per_share"]
@@ -330,10 +356,6 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
         )
 
     # quality flag
-    # misma lógica que venías usando:
-    # - FCF/acción con slope positiva
-    # - recompras netas (>5% menos acciones)
-    # - apalancamiento razonable (<2x ND/EBITDA en el último punto real)
     flag_fcf_up = _flag_positive(fcf_slope_5y)
     flag_buybacks = (
         buyback_pct_5y is not None
@@ -347,33 +369,23 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
     )
     is_quality_compounder = bool(flag_fcf_up and flag_buybacks and flag_net_debt_ok)
 
-    # 4. armar fila final con TODAS las llaves que app.py espera
+    # 4. fila final con TODAS las llaves que app.py espera
     row: Dict[str, Any] = {
-        # -------- identidad / descripción básica --------
+        # identidad
         "ticker":            core.get("ticker", symbol),
         "name":              core.get("name", ""),
-        "companyName":       core.get("name", ""),  # app a veces mira companyName
+        "companyName":       core.get("name", ""),
         "sector":            core.get("sector", "—"),
         "industry":          core.get("industry", "—"),
         "marketCap":         core.get("marketCap"),
         "beta":              core.get("beta"),
         "business_summary":  core.get("business_summary", ""),
 
-        # -------- salud financiera --------
-        # Estas dos ya NO vienen en el core nuevo, las dejamos None:
+        # scores (placeholder porque metrics nuevo no calcula esto)
         "altmanZScore":      None,
         "piotroskiScore":    None,
 
-        # deuda
-        "netDebt_to_EBITDA": core.get("netDebt_to_EBITDA"),
-        "net_debt_to_ebitda_last": net_debt_to_ebitda_last,
-        "net_debt_change_5y":      net_debt_change_5y,
-
-        # heurística moat del core
-        "moat_flag":         core.get("moat_flag", "—"),
-
-        # -------- crecimiento y calidad operativa --------
-        # El core nuevo tampoco calcula growth/CAGR, así que van None
+        # growth / CAGR (placeholder)
         "revenueGrowth":            None,
         "operatingCashFlowGrowth":  None,
         "freeCashFlowGrowth":       None,
@@ -383,19 +395,26 @@ def build_company_core_snapshot(symbol: str) -> Dict[str, Any] | None:
         "ocf_CAGR_5y":              None,
         "ocf_CAGR_3y":              None,
 
-        # recompras / FCF por acción slope
-        "fcf_per_share_slope_5y": fcf_slope_5y,
-        "buyback_pct_5y":        buyback_pct_5y,
+        # deuda / leverage
+        "netDebt_to_EBITDA":       core.get("netDebt_to_EBITDA"),
+        "net_debt_to_ebitda_last": net_debt_to_ebitda_last,
+        "net_debt_change_5y":      net_debt_change_5y,
+
+        # recompras / FCF/acción
+        "fcf_per_share_slope_5y":  fcf_slope_5y,
+        "buyback_pct_5y":          buyback_pct_5y,
+
+        # moat heurístico
+        "moat_flag":               core.get("moat_flag", "—"),
 
         # flag compuesto tipo "✅ COMPOUNDER"
-        "is_quality_compounder": is_quality_compounder,
+        "is_quality_compounder":   is_quality_compounder,
 
-        # notas estratégicas placeholder (por ahora vacío;
-        # enrich_company_snapshot luego mete más color)
-        "why_it_matters":   "",
-        "core_risk_note":   "",
+        # notas cualitativas básicas (se llenan mejor en enrich_company_snapshot)
+        "why_it_matters":          "",
+        "core_risk_note":          "",
 
-        # -------- series históricas para Tab2 --------
+        # series históricas para Tab2
         "years":                years_series,
         "fcf_per_share_hist":   fcfps_series,
         "shares_hist":          shares_series,
@@ -427,13 +446,7 @@ def build_market_snapshot() -> List[Dict[str, Any]]:
         if snap is None:
             continue
 
-        # (opcional) acá podríamos filtrar las peores palancas ya,
-        # pero hoy dejamos que el slider en la UI haga ese filtro.
-        # Ejemplo si quisieras cortar hard:
-        # nde = snap.get("net_debt_to_ebitda_last")
-        # if nde is not None and float(nde) > MAX_NET_DEBT_TO_EBITDA:
-        #     continue
-
+        # podríamos filtrar apalancadas acá, pero dejamos que la UI lo haga
         rows.append(snap)
 
     return rows
@@ -445,10 +458,12 @@ def build_market_snapshot() -> List[Dict[str, Any]]:
 
 def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Recibe la fila base (de build_company_core_snapshot) y
-    agrega insiders / news / transcript resumidos para el panel detalle.
+    Recibe la fila base y agrega:
+      - insiders
+      - sentimiento prensa
+      - resumen earnings call
+    Si text_analysis falló al importar, usamos dummies neutras.
     """
-
     symbol = base_row.get("ticker") or base_row.get("symbol")
     if not symbol:
         return base_row
@@ -458,7 +473,6 @@ def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
         insider_raw = get_insider_trading(symbol)
     except Exception:
         insider_raw = []
-
     insider_signal, insider_note = summarize_insiders(insider_raw)
 
     # news / sentimiento
@@ -466,7 +480,6 @@ def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
         news_raw = get_news(symbol)
     except Exception:
         news_raw = []
-
     sentiment_flag, sentiment_reason = summarize_news_sentiment(news_raw)
 
     # earnings call transcript
@@ -474,7 +487,6 @@ def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
         transcript_txt = get_earnings_call_transcript(symbol)
     except Exception:
         transcript_txt = ""
-
     transcript_summary = summarize_transcript(transcript_txt)
 
     enriched = dict(base_row)
