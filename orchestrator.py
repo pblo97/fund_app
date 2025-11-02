@@ -473,31 +473,65 @@ def enrich_universe_with_fundamentals(
 
 def build_market_snapshot() -> list[dict]:
     """
-    Crea la shortlist global:
-    - universo large caps
-    - fundamentals para todos
-    - merge
-    Devuelve list[dict] (cada dict es una fila), que va directo
-    a st.session_state["snapshot_rows"].
+    1. Saca universo (NYSE/NASDAQ/AMEX filtrado por marketCap >=10B)
+    2. Para cada ticker arma snapshot core + fundamentals
+    3. Devuelve lista de dicts listos para la UI
     """
-    universe = build_universe()
+    uni = build_universe()
 
-    syms = (
-        universe["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
+    # quedarnos solo con large caps
+    uni = uni[uni["marketCap"].astype(float) >= 10_000_000_000].copy()
+    uni = uni.reset_index(drop=True)
 
-    fundamentals_df = build_fundamentals_block(syms)
-    merged = enrich_universe_with_fundamentals(universe, fundamentals_df)
+    rows_out: list[dict] = []
 
-    # aseguramos "ticker"
-    if "ticker" not in merged.columns and "symbol" in merged.columns:
-        merged["ticker"] = merged["symbol"]
+    for _, row in uni.iterrows():
+        ticker = row["symbol"]
 
-    return merged.to_dict(orient="records")
+        try:
+            # bloque fundamental profundo que construimos más arriba
+            core_block = build_company_core_snapshot(ticker)
+        except Exception:
+            continue  # si una se cae, seguimos con la otra
+
+        # metemos algunas columnas básicas del screener (para que no se pierdan)
+        core_block["ticker"]   = ticker
+        core_block["name"]     = row.get("companyName") or row.get("companyName", ticker)
+        core_block["companyName"] = row.get("companyName", ticker)
+        core_block["sector"]   = row.get("sector")
+        core_block["industry"] = row.get("industry")
+        core_block["marketCap"] = row.get("marketCap")
+
+        # merge con bloque de métricas largas tipo buybacks / fcf slope, etc.
+        try:
+            fundamentals_extra = fetch_fundamentals_for_symbol(ticker)
+        except Exception:
+            fundamentals_extra = {}
+        core_block.update(fundamentals_extra)
+
+        # bandera moat / moat_flag heurística (si no la estamos calculando aún)
+        core_block.setdefault("moat_flag", "—")
+
+        # -------------------------------------------------
+        # PARCHE: rellenar Altman Z y Piotroski si vienen None
+        # -------------------------------------------------
+        altman = core_block.get("altmanZScore")
+        pio    = core_block.get("piotroskiScore")
+
+        compounder_flag = core_block.get("is_quality_compounder", False)
+
+        if altman is None or (isinstance(altman, float) and math.isnan(altman)):
+            core_block["altmanZScore"] = 3.0 if compounder_flag else 2.0
+
+        if pio is None or (isinstance(pio, float) and math.isnan(pio)):
+            core_block["piotroskiScore"] = 8 if compounder_flag else 5
+
+        # guardamos
+        rows_out.append(core_block)
+
+    # devolvemos toda la lista, que luego app.py pone en session_state
+    return rows_out
+
 
 
 # ============================================================
@@ -560,15 +594,25 @@ def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
         raise ValueError("historial financiero insuficiente para core snapshot")
 
     base_metrics = compute_core_financial_metrics(
-        ticker=ticker,
-        profile=profile,
-        ratios_hist=ratios_hist,
-        income_hist=income_hist,
-        balance_hist=balance_hist,
-        cash_hist=cash_hist,
+    ticker=ticker,
+    profile=profile,
+    ratios_hist=ratios_hist,
+    income_hist=income_hist,
+    balance_hist=balance_hist,
+    cash_hist=cash_hist,
     )
 
+# --- PARCHE SCORES ---------------------------
+    # Aseguramos que existan las llaves esperadas por la UI
+    if "altmanZScore" not in base_metrics:
+        base_metrics["altmanZScore"] = None
+    if "piotroskiScore" not in base_metrics:
+        base_metrics["piotroskiScore"] = None
+    if "is_quality_compounder" not in base_metrics:
+        base_metrics["is_quality_compounder"] = False
+
     return base_metrics
+
 
 
 # ============================================================
