@@ -6,11 +6,10 @@ import matplotlib.pyplot as plt
 
 from config import MAX_NET_DEBT_TO_EBITDA
 from orchestrator import (
-    build_full_snapshot,
     build_market_snapshot,
+    build_company_core_snapshot,
     enrich_company_snapshot,
 )
-
 # -------------------------------------------------
 # Helpers de formato
 # -------------------------------------------------
@@ -332,6 +331,10 @@ if "kept" not in st.session_state:
 # WATCHLIST ENRIQUECIDA (arriba de todo)
 # -------------------------------------------------
 
+# -------------------------------------------------
+# WATCHLIST ENRIQUECIDA (arriba de todo)
+# -------------------------------------------------
+
 kept_syms = (
     st.session_state["kept"]["symbol"]
       .dropna()
@@ -342,21 +345,23 @@ kept_syms = (
     else []
 )
 
+watch_rows = []
 if kept_syms:
-    try:
-        final_df_watchlist = build_full_snapshot(kept_syms)
-    except Exception as e:
-        final_df_watchlist = pd.DataFrame()
-        st.warning(f"No pude enriquecer tu watchlist: {e}")
+    for sym in kept_syms:
+        snap = build_company_core_snapshot(sym)
+        if snap is not None:
+            watch_rows.append(snap)
+
+if watch_rows:
+    final_df_watchlist = pd.DataFrame(watch_rows)
 else:
     final_df_watchlist = pd.DataFrame()
 
 if not final_df_watchlist.empty:
     st.subheader("Watchlist enriquecida (tus tickers marcados)")
-
     cols_watch = [
-        "symbol",
-        "companyName",
+        "ticker",
+        "name",
         "sector",
         "industry",
         "marketCap",
@@ -374,7 +379,6 @@ if not final_df_watchlist.empty:
     )
 else:
     st.info("Aún no hay watchlist enriquecida (no hay 'kept_syms').")
-
 
 # -------------------------------------------------
 # BOTÓN: construir shortlist global de mercado
