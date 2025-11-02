@@ -224,40 +224,102 @@ def _flag_positive(x):
 
 def build_universe() -> pd.DataFrame:
     """
-    Descarga screener por cada exchange, concatena, dedup,
-    y filtra solo large caps.
+    Descarga screener por exchange y concatena.
+    Devuelve solo large caps únicas por symbol.
+    Columnas mínimas esperadas:
+        symbol, companyName (o name), sector, industry, marketCap
     """
     frames: List[pd.DataFrame] = []
+
     for exch in EXCHANGES:
         try:
             chunk = run_screener_for_exchange(exch)
+
+            # 1. saltar si viene vacío
             if chunk is None:
                 continue
-            frames.append(chunk)
+
+            # 2. normalizar a DataFrame
+            #    casos posibles:
+            #    - list[dict] -> pd.DataFrame(list_of_dicts)
+            #    - dict con "data" -> usar eso si aplica
+            #    - ya es DataFrame -> lo dejamos igual
+            if isinstance(chunk, list):
+                # típico: FMP te da [ {symbol:..., ...}, {...}, ... ]
+                chunk_df = pd.DataFrame(chunk)
+            elif isinstance(chunk, dict):
+                # a veces APIs devuelven {"data":[...]} o similar.
+                if "data" in chunk and isinstance(chunk["data"], list):
+                    chunk_df = pd.DataFrame(chunk["data"])
+                else:
+                    # si es un dict suelto de una sola empresa, igual lo metemos
+                    chunk_df = pd.DataFrame([chunk])
+            elif isinstance(chunk, pd.DataFrame):
+                chunk_df = chunk
+            else:
+                # tipo raro -> lo ignoramos
+                continue
+
+            # aseguramos que exista al menos symbol para no meter basura
+            if "symbol" not in chunk_df.columns:
+                continue
+
+            frames.append(chunk_df)
+
         except Exception:
+            # si FMP falla en un exchange, seguimos con el resto
             continue
 
+    # si no hubo nada usable, devolvemos df vacío coherente
     if not frames:
-        return pd.DataFrame(columns=["symbol", "companyName", "sector", "industry", "marketCap"])
+        return pd.DataFrame(
+            columns=["symbol", "companyName", "sector", "industry", "marketCap"]
+        )
 
-    uni_raw = pd.concat(frames, ignore_index=True)
+    # 3. concatenar todo
+    universe_raw = pd.concat(frames, ignore_index=True)
 
-    # normalizar nombre
-    if "name" in uni_raw.columns and "companyName" not in uni_raw.columns:
-        uni_raw = uni_raw.rename(columns={"name": "companyName"})
+    # 4. normalizar nombres esperados
+    #    (algunas respuestas traen 'name' en vez de 'companyName')
+    if "companyName" not in universe_raw.columns and "name" in universe_raw.columns:
+        universe_raw = universe_raw.rename(columns={"name": "companyName"})
 
-    # dedupe
-    uni_raw = (
-        uni_raw
-        .drop_duplicates(subset=["symbol"])
-        .reset_index(drop=True)
+    # si no trae marketCap directo pero trae mktCap u otro alias, hacemos fallback
+    if "marketCap" not in universe_raw.columns:
+        for alt in ["mktCap", "marketCapIntraday"]:
+            if alt in universe_raw.columns:
+                universe_raw["marketCap"] = universe_raw[alt]
+                break
+        if "marketCap" not in universe_raw.columns:
+            universe_raw["marketCap"] = None
+
+    # 5. dedupe por symbol
+    universe_raw = (
+        universe_raw.drop_duplicates(subset=["symbol"])
+                    .reset_index(drop=True)
     )
 
-    # filtrar large cap
-    mask_large = uni_raw.apply(_is_large_cap, axis=1)
-    uni_large = uni_raw[mask_large].reset_index(drop=True)
+    # 6. filtrar large caps con el helper _is_large_cap
+    mask_large = universe_raw.apply(_is_large_cap, axis=1)
+    universe_large = universe_raw[mask_large].reset_index(drop=True)
 
-    return uni_large
+    # 7. dejemos sólo columnas limpias que el resto usa
+    keep_cols = [
+        "symbol",
+        "companyName",
+        "sector",
+        "industry",
+        "marketCap",
+    ]
+    # agregamos si existen; si faltan, las creamos en blanco para no romper después
+    for col in keep_cols:
+        if col not in universe_large.columns:
+            universe_large[col] = None
+
+    universe_large = universe_large[keep_cols].copy()
+
+    return universe_large
+
 
 
 # =========================================================
