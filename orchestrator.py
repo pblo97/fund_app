@@ -605,44 +605,138 @@ def build_full_snapshot(kept_symbols: list[str]) -> pd.DataFrame:
 # 6. build_company_core_snapshot() → métricas "crudas" 1 ticker
 # ============================================================
 
-def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
+def build_company_core_snapshot(ticker: str) -> dict:
     """
-    Snapshot más detallado de un ticker único usando
-    estados financieros y ratios. Útil como base para análisis
-    más profundo o para debug.
+    Para 1 ticker:
+    - baja profile + estados financieros + ratios
+    - arma snapshot base con compute_core_financial_metrics()
+    - NORMALIZA las llaves que la app espera (altmanZScore, piotroskiScore, etc.)
     """
+
     profile = get_profile(ticker)
     income_hist = get_income_statement(ticker)
     balance_hist = get_balance_sheet(ticker)
     cash_hist = get_cash_flow(ticker)
     ratios_hist = get_ratios(ticker)
 
-    # validación mínima para no reventar
-    def _ok_list(x):
-        return isinstance(x, list) and len(x) >= 2
+    # validación mínima para no romper más adelante
+    if (
+        not isinstance(income_hist, list) or len(income_hist) < 2 or
+        not isinstance(balance_hist, list) or len(balance_hist) < 2 or
+        not isinstance(cash_hist, list) or len(cash_hist) < 2
+    ):
+        # devolvemos dict vacío en caso extremo
+        return {
+            "ticker": ticker,
+            "altmanZScore": None,
+            "piotroskiScore": None,
+            "revenueGrowth": None,
+            "operatingCashFlowGrowth": None,
+            "freeCashFlowGrowth": None,
+            "debtGrowth": None,
+            "rev_CAGR_5y": None,
+            "ocf_CAGR_5y": None,
+            "netDebt_to_EBITDA": None,
+        }
 
-    if not (_ok_list(income_hist) and _ok_list(balance_hist) and _ok_list(cash_hist)):
-        raise ValueError("historial financiero insuficiente para core snapshot")
-
-    base_metrics = compute_core_financial_metrics(
-    ticker=ticker,
-    profile=profile,
-    ratios_hist=ratios_hist,
-    income_hist=income_hist,
-    balance_hist=balance_hist,
-    cash_hist=cash_hist,
+    raw_core = compute_core_financial_metrics(
+        ticker=ticker,
+        profile=profile,
+        ratios_hist=ratios_hist,
+        income_hist=income_hist,
+        balance_hist=balance_hist,
+        cash_hist=cash_hist,
     )
 
-# --- PARCHE SCORES ---------------------------
-    # Aseguramos que existan las llaves esperadas por la UI
-    if "altmanZScore" not in base_metrics:
-        base_metrics["altmanZScore"] = None
-    if "piotroskiScore" not in base_metrics:
-        base_metrics["piotroskiScore"] = None
-    if "is_quality_compounder" not in base_metrics:
-        base_metrics["is_quality_compounder"] = False
+    # ------------------------------------------------------------------
+    # NORMALIZACIÓN
+    #
+    # La idea:
+    # - si compute_core_financial_metrics() ya devuelve planos, usamos eso
+    # - si devuelve anidado, tratamos de sacarlo igual
+    # ------------------------------------------------------------------
 
-    return base_metrics
+    def pick(*candidates):
+        """devuelve el primer valor no None de una lista de llaves posibles."""
+        for c in candidates:
+            if c is not None:
+                return c
+        return None
+
+    # sacamos altman, piotroski
+    altman_z = pick(
+        raw_core.get("altmanZScore"),
+        raw_core.get("altman_z"),
+        raw_core.get("altman"), 
+        (raw_core.get("scores", {}) if isinstance(raw_core.get("scores"), dict) else {}).get("altmanZScore"),
+    )
+
+    piotro = pick(
+        raw_core.get("piotroskiScore"),
+        raw_core.get("piotroski"),
+        (raw_core.get("scores", {}) if isinstance(raw_core.get("scores"), dict) else {}).get("piotroskiScore"),
+    )
+
+    # crecimientos (último FY vs FY-1)
+    rev_growth = pick(
+        raw_core.get("revenueGrowth"),
+        raw_core.get("revenue_growth"),
+        (raw_core.get("growth", {}) if isinstance(raw_core.get("growth"), dict) else {}).get("revenueGrowth"),
+    )
+
+    ocf_growth = pick(
+        raw_core.get("operatingCashFlowGrowth"),
+        raw_core.get("ocfGrowth"),
+        (raw_core.get("growth", {}) if isinstance(raw_core.get("growth"), dict) else {}).get("operatingCashFlowGrowth"),
+    )
+
+    fcf_growth = pick(
+        raw_core.get("freeCashFlowGrowth"),
+        raw_core.get("fcfGrowth"),
+        (raw_core.get("growth", {}) if isinstance(raw_core.get("growth"), dict) else {}).get("freeCashFlowGrowth"),
+    )
+
+    debt_growth = pick(
+        raw_core.get("debtGrowth"),
+        raw_core.get("debt_growth"),
+        (raw_core.get("growth", {}) if isinstance(raw_core.get("growth"), dict) else {}).get("debtGrowth"),
+    )
+
+    # CAGR multianual
+    rev_cagr_5y = pick(
+        raw_core.get("rev_CAGR_5y"),
+        raw_core.get("revenue_CAGR_5y"),
+        (raw_core.get("cagr", {}) if isinstance(raw_core.get("cagr"), dict) else {}).get("rev_CAGR_5y"),
+    )
+
+    ocf_cagr_5y = pick(
+        raw_core.get("ocf_CAGR_5y"),
+        raw_core.get("ocfCAGR_5y"),
+        (raw_core.get("cagr", {}) if isinstance(raw_core.get("cagr"), dict) else {}).get("ocf_CAGR_5y"),
+    )
+
+    # apalancamiento
+    nde = pick(
+        raw_core.get("netDebt_to_EBITDA"),
+        raw_core.get("net_debt_to_ebitda"),
+        raw_core.get("netDebtToEbitda"),
+        (raw_core.get("leverage", {}) if isinstance(raw_core.get("leverage"), dict) else {}).get("netDebt_to_EBITDA"),
+    )
+
+    core_out = {
+        "ticker": ticker,
+        "altmanZScore": altman_z,
+        "piotroskiScore": piotro,
+        "revenueGrowth": rev_growth,
+        "operatingCashFlowGrowth": ocf_growth,
+        "freeCashFlowGrowth": fcf_growth,
+        "debtGrowth": debt_growth,
+        "rev_CAGR_5y": rev_cagr_5y,
+        "ocf_CAGR_5y": ocf_cagr_5y,
+        "netDebt_to_EBITDA": nde,
+    }
+
+    return core_out
 
 
 
