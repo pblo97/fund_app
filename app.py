@@ -56,14 +56,14 @@ def _ensure_list(v):
 
 
 def dataframe_from_rows(rows: list[dict], max_leverage: float):
-    """
-    Convierte la shortlist global (list[dict]) en un DataFrame rico,
-    con columnas formateadas y la flag de apalancamiento leverage_ok.
-    """
     df = pd.DataFrame(rows).copy()
 
+    # columnas que esperamos tener disponible en la UI
     needed = [
-        "netDebt_to_EBITDA",
+        "ticker",
+        "name",
+        "sector",
+        "industry",
         "marketCap",
         "altmanZScore",
         "piotroskiScore",
@@ -75,17 +75,30 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         "rev_CAGR_3y",
         "ocf_CAGR_5y",
         "ocf_CAGR_3y",
-        "sector",
-        "industry",
+        "netDebt_to_EBITDA",          # <- viene de build_company_core_snapshot
+        "net_debt_to_ebitda_last",    # <- viene de fetch_fundamentals_for_symbol
+        "fcf_per_share_slope_5y",
+        "buyback_pct_5y",
+        "is_quality_compounder",
         "moat_flag",
-        "ticker",
-        "name",
     ]
+
     for col in needed:
         if col not in df.columns:
             df[col] = None
 
-    # leverage_ok
+    # preferimos usar la métrica anualizada que calculamos nosotros:
+    # net_debt_to_ebitda_last > netDebt_to_EBITDA si existe.
+    def _pick_nde(row):
+        cand1 = row.get("net_debt_to_ebitda_last")
+        cand2 = row.get("netDebt_to_EBITDA")
+        if cand1 is not None and not (isinstance(cand1, float) and math.isnan(cand1)):
+            return cand1
+        return cand2
+
+    df["netDebt_to_EBITDA_effective"] = df.apply(_pick_nde, axis=1)
+
+    # leverage_ok según el slider
     def _lev_ok(x):
         if x is None:
             return True
@@ -96,15 +109,34 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         except Exception:
             return True
 
-    df["leverage_ok"] = df["netDebt_to_EBITDA"].apply(_lev_ok)
+    df["leverage_ok"] = df["netDebt_to_EBITDA_effective"].apply(_lev_ok)
 
-    # pretty columns
-    df["netDebt_to_EBITDA_fmt"] = df["netDebt_to_EBITDA"].apply(
-        lambda x: "—"
-        if x is None or (isinstance(x, float) and math.isnan(x))
-        else f"{x:.2f}"
+    # ---------- FORMATTERS VISUALES ----------
+    df["netDebt_to_EBITDA_fmt"] = df["netDebt_to_EBITDA_effective"].apply(
+        lambda x: (
+            "—"
+            if x is None or (isinstance(x, float) and math.isnan(x))
+            else f"{float(x):.2f}"
+        )
     )
+
     df["marketCap_fmt"] = df["marketCap"].apply(_fmt_num)
+
+    df["altmanZScore_fmt"] = df["altmanZScore"].apply(
+        lambda x: (
+            "—"
+            if x is None or (isinstance(x, float) and math.isnan(x))
+            else f"{float(x):.2f}"
+        )
+    )
+
+    df["piotroskiScore_fmt"] = df["piotroskiScore"].apply(
+        lambda x: (
+            "—"
+            if x is None or (isinstance(x, float) and math.isnan(x))
+            else f"{float(x):.0f}/9"
+        )
+    )
 
     df["revenueGrowth_pct"] = df["revenueGrowth"].apply(_fmt_pct)
     df["ocfGrowth_pct"] = df["operatingCashFlowGrowth"].apply(_fmt_pct)
@@ -112,21 +144,21 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
     df["debtGrowth_pct"] = df["debtGrowth"].apply(_fmt_pct)
 
     df["rev_CAGR_5y_pct"] = df["rev_CAGR_5y"].apply(_fmt_pct)
-    df["rev_CAGR_3y_pct"] = df["rev_CAGR_3y"].apply(_fmt_pct)
     df["ocf_CAGR_5y_pct"] = df["ocf_CAGR_5y"].apply(_fmt_pct)
-    df["ocf_CAGR_3y_pct"] = df["ocf_CAGR_3y"].apply(_fmt_pct)
 
-    df["altmanZScore_fmt"] = df["altmanZScore"].apply(
-        lambda x: "—"
-        if x is None or (isinstance(x, float) and math.isnan(x))
-        else f"{float(x):.2f}"
-    )
-    df["piotroskiScore_fmt"] = df["piotroskiScore"].apply(
-        lambda x: "—"
-        if x is None or (isinstance(x, float) and math.isnan(x))
-        else f"{float(x):.0f}/9"
+    # columnas nuevas útiles:
+    df["buyback_pct_5y_fmt"] = df["buyback_pct_5y"].apply(_fmt_pct)
+
+    df["fcf_per_share_slope_5y_fmt"] = df["fcf_per_share_slope_5y"].apply(
+        lambda x: (
+            "—"
+            if x is None
+            or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
+            else f"{float(x):.2f} /yr"
+        )
     )
 
+    # devolvemos df enriquecido
     return df
 
 
@@ -365,6 +397,14 @@ with tab1:
             "sector",
             "industry",
             "marketCap_fmt",
+
+            "netDebt_to_EBITDA_fmt",
+            "buyback_pct_5y_fmt",
+            "fcf_per_share_slope_5y_fmt",
+
+            "is_quality_compounder",
+
+            # placeholders que llenaremos luego con endpoints batch:
             "altmanZScore_fmt",
             "piotroskiScore_fmt",
             "revenueGrowth_pct",
@@ -373,7 +413,6 @@ with tab1:
             "debtGrowth_pct",
             "rev_CAGR_5y_pct",
             "ocf_CAGR_5y_pct",
-            "netDebt_to_EBITDA_fmt",
             "moat_flag",
         ]
         cols_basic = [c for c in cols_basic if c in df_screen.columns]

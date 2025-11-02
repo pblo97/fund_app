@@ -446,13 +446,10 @@ def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
     return base_metrics
 
 
-def build_market_snapshot(limit: int = 40) -> List[Dict[str, Any]]:
+def build_market_snapshot(limit: int = 40) -> list[dict]:
     """
-    Construye la shortlist global (lo que Tab1 y Tab2 usan).
-    Ahora además mezcla:
-    - snapshot core (P&L, balance, ratios)
-    - bloque fundamentals (FCF/acción slope, recompras, deuda, etc.)
-    y luego mete los placeholders de growth/Altman/etc.
+    Devuelve las filas que Tab1 / Tab2 usan (rows_data).
+    Ahora sí incluye fundamentals (fcf por acción, buybacks, deuda, etc.).
     """
 
     uni = build_universe()
@@ -465,48 +462,71 @@ def build_market_snapshot(limit: int = 40) -> List[Dict[str, Any]]:
         .tolist()
     )
 
-    tickers = tickers[:limit]  # puedes subir/eliminar este límite
+    # puedes subir o eliminar este límite
+    tickers = tickers[:limit]
 
-    rows_raw: List[Dict[str, Any]] = []
+    rows_raw: list[dict] = []
 
     for tkr in tickers:
+        # 1. core fundamental snapshot (income/balance/cash/ratios)
         try:
-            # métrica core (income/balance/cash/ratios)
             core = build_company_core_snapshot(tkr)
         except Exception:
-            # si ni siquiera podemos sacar los básicos, saltamos este ticker
+            # si no puedo ni armar lo básico, skip
             continue
 
-        # tratamos también de sacar fundamentals "anualizados"
-        # (fcf_per_share_slope_5y, recompras, deuda neta, etc.)
+        # 2. bloque "fundamentals" anualizado (tendencias 3-5y)
         try:
             fblock = fetch_fundamentals_for_symbol(tkr)
         except Exception:
             fblock = {
+                "symbol": tkr,
                 "fcf_per_share_slope_5y": None,
                 "buyback_pct_5y": None,
                 "net_debt_change_5y": None,
                 "net_debt_to_ebitda_last": None,
             }
 
-        # mergeamos ambos dicts
+        # merge de ambos dicts
         merged = dict(core)
         merged.update(fblock)
 
-        # aseguramos campos que tu UI usa con nombres consistentes
-        # ticker vs symbol
+        # ticker / symbol consistentes
         if "ticker" not in merged and "symbol" in merged:
             merged["ticker"] = merged["symbol"]
         if "symbol" not in merged and "ticker" in merged:
             merged["symbol"] = merged["ticker"]
 
-        # agregamos a rows_raw
+        # Quality flags como en enrich_universe_with_fundamentals()
+        def _pos(x):
+            return (x is not None) and (not (isinstance(x, float) and math.isnan(x))) and (x > 0)
+
+        merged["flag_fcf_up"] = _pos(merged.get("fcf_per_share_slope_5y"))
+        merged["flag_buybacks"] = (
+            (merged.get("buyback_pct_5y") is not None)
+            and (not (isinstance(merged.get("buyback_pct_5y"), float) and math.isnan(merged.get("buyback_pct_5y"))))
+            and (merged.get("buyback_pct_5y") > 0.05)
+        )
+
+        nde_last = merged.get("net_debt_to_ebitda_last")
+        merged["flag_net_debt_ok"] = (
+            (nde_last is not None)
+            and (not (isinstance(nde_last, float) and math.isnan(nde_last)))
+            and (nde_last < 2)
+        )
+
+        merged["is_quality_compounder"] = (
+            merged["flag_fcf_up"]
+            and merged["flag_buybacks"]
+            and merged["flag_net_debt_ok"]
+        )
+
         rows_raw.append(merged)
 
-    # ahora metemos placeholders tipo altmanZScore, growth, CAGR, etc.
+    # 3. placeholders que todavía no llenamos con API reales (Altman Z, Piotroski, etc.)
     rows_enriched = _merge_scores_and_growth(rows_raw)
 
-    # filtramos apalancamiento
+    # 4. filtro apalancamiento global (usa MAX_NET_DEBT_TO_EBITDA)
     final_rows = [r for r in rows_enriched if _quality_filter_final(r)]
 
     return final_rows
