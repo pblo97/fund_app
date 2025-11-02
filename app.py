@@ -158,6 +158,33 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         )
     )
 
+    def fmt_slope(val):
+        # casos inválidos -> "—"
+        if val is None:
+            return "—"
+        if isinstance(val, float):
+            if math.isnan(val) or math.isinf(val):
+                return "—"
+        try:
+            return f"{float(val):.2f} /yr"
+        except Exception:
+            return "—"
+
+    if "fcf_per_share_slope_5y" in df.columns:
+        df["fcf_per_share_slope_5y_fmt"] = df["fcf_per_share_slope_5y"].apply(fmt_slope)
+    else:
+        df["fcf_per_share_slope_5y_fmt"] = "—"
+
+    def _fmt_compounder(flag):
+        if flag is True:
+            return "✅ COMPOUNDER"
+        return "—"
+
+    if "is_quality_compounder" in df.columns:
+        df["is_quality_compounder_fmt"] = df["is_quality_compounder"].apply(_fmt_compounder)
+    else:
+        df["is_quality_compounder_fmt"] = "—"
+
     # devolvemos df enriquecido
     return df
 
@@ -397,14 +424,10 @@ with tab1:
             "sector",
             "industry",
             "marketCap_fmt",
-
             "netDebt_to_EBITDA_fmt",
-            "buyback_pct_5y_fmt",
-            "fcf_per_share_slope_5y_fmt",
-
-            "is_quality_compounder",
-
-            # placeholders que llenaremos luego con endpoints batch:
+            "buyback_pct_5y_fmt",            # % recompras últimos ~5y
+            "fcf_per_share_slope_5y_fmt",    # tendencia de FCF/acción
+            "is_quality_compounder_fmt",     # ✅ COMPOUNDER / —
             "altmanZScore_fmt",
             "piotroskiScore_fmt",
             "revenueGrowth_pct",
@@ -416,7 +439,6 @@ with tab1:
             "moat_flag",
         ]
         cols_basic = [c for c in cols_basic if c in df_screen.columns]
-
         if df_screen.empty:
             st.warning("Con tu límite de apalancamiento no queda ninguna candidata.")
         else:
