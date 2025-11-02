@@ -212,29 +212,34 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
 # 3. Shortlist de TODO el mercado (Tab1)
 # ===============================
 
-def build_market_snapshot() -> List[Dict[str, Any]]:
+def build_market_snapshot_lite(limit: int = 15) -> list[dict]:
     """
-    - arma universo large cap
-    - para cada symbol construye una fila
-    - devuelve lista[dict] (la app después la convierte a DataFrame bonito)
+    Versión reducida para dev:
+    - toma el universo large cap
+    - se queda solo con los primeros `limit` tickers
+    - arma el snapshot de cada uno
     """
     uni = build_universe()
-    out: List[Dict[str, Any]] = []
 
-    for _, r in uni.iterrows():
-        sym = str(r["symbol"])
+    rows: list[dict] = []
+    count = 0
+
+    for _idx, r in uni.iterrows():
+        if count >= limit:
+            break
+
+        sym = str(r.get("symbol", "")).strip()
         if not sym:
             continue
 
-        snap = build_company_row(sym)
+        snap = build_company_row(sym)  # <- la función limpia que arma 1 fila
         if snap is None:
             continue
 
-        # opcional: si quisieras filtrar empresas ultra apalancadas acá,
-        # podrías mirar snap["netDebt_to_EBITDA"] contra MAX_NET_DEBT_TO_EBITDA.
-        out.append(snap)
+        rows.append(snap)
+        count += 1
 
-    return out
+    return rows
 
 
 # ===============================

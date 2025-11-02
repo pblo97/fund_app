@@ -1,8 +1,18 @@
 # fmp_api.py
 #
-# Funciones de acceso crudo a la API de FMP.
-# Cada función devuelve datos en formato usable (list[dict] o DataFrame listo).
-# Agregamos batch para scores y growth, y filtramos large caps en el screener.
+# Acceso crudo a la API de FMP, con timeouts y tolerancia a fallos.
+# Objetivo:
+#   - Nunca colgar Streamlit.
+#   - Entregar estructuras predecibles (list[dict], DataFrame)
+#   - Mantener las firmas que ya está usando orchestrator/app.
+#
+# Incluye:
+#   - Screener large cap
+#   - Batch de scores (Altman, Piotroski)
+#   - Batch de growth (crecimiento, deuda, CAGR compuesto)
+#   - Extractores básicos de estados financieros e históricos
+
+from __future__ import annotations
 
 import time
 from typing import Any, Dict, List, Optional
@@ -16,23 +26,40 @@ BASE = "https://financialmodelingprep.com/api/v3"
 
 
 # -------------------------------------------------
-# util interno: GET genérico
+# util interno: GET genérico (parchado con timeout y manejo de errores)
 # -------------------------------------------------
 def _get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
     """
     Llamada GET genérica a la API de FMP.
     endpoint: ej. "/profile/AAPL"
     params: dict con parámetros query (sin la apikey).
-    Devuelve r.json() tal cual.
+    Devuelve r.json() tal cual SI PUEDE.
+    En caso de error, devolvemos [] (lista vacía) para endpoints tipo lista
+    o {} (dict vacío) si parece ser objeto único.
     """
     if params is None:
         params = {}
     params["apikey"] = FMP_API_KEY
     url = f"{BASE}{endpoint}"
 
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+    except requests.exceptions.Timeout:
+        # timeout → devolvemos vacío seguro
+        # muchos endpoints de FMP devuelven lista, así que devolvemos []
+        return []
+    except requests.exceptions.RequestException:
+        # HTTPError / conexión rota / etc.
+        return []
+
+    try:
+        data = r.json()
+    except Exception:
+        # JSON inválido
+        return []
+
+    return data
 
 
 # -------------------------------------------------
@@ -41,8 +68,9 @@ def _get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
 def _to_df(payload: Any) -> pd.DataFrame:
     """
     Normaliza cualquier payload JSON en un DataFrame.
-    - Si viene dict -> [dict]
-    - Si viene None -> []
+    - None -> df vacío
+    - dict -> lo envolvemos en [dict]
+    - list[dict] -> DataFrame normal
     """
     if payload is None:
         return pd.DataFrame()
@@ -55,64 +83,66 @@ def _to_df(payload: Any) -> pd.DataFrame:
 
 
 # -------------------------------------------------
-# util interno: dado un df con múltiples años por symbol,
-# nos quedamos con el FY más reciente por símbolo
+# util interno: nos quedamos con el FY más reciente por símbolo
 # -------------------------------------------------
 def _latest_fy_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Espera columnas: symbol, date, period, fiscalYear, etc.
-    Ordena por date desc y toma el head(1) por símbolo.
+    Espera columnas: symbol, date (o fiscalDate), etc.
+    Ordena por date desc y toma 1 fila por símbolo.
     """
     if df.empty:
-        return df
+        return df.copy()
 
-    # asegurar columnas
+    df = df.copy()
+
+    # Aseguramos tener columna symbol, si no existe no tiene sentido continuar
     if "symbol" not in df.columns:
         return pd.DataFrame()
 
-    # parsear fecha si existe
+    # Normalizamos fecha: si no hay 'date', intentamos 'fiscalDate'
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    elif "fiscalDate" in df.columns:
+        df["date"] = pd.to_datetime(df["fiscalDate"], errors="coerce")
     else:
         df["date"] = pd.NaT
 
-    # ordenar más reciente primero y agrupar
     df = df.sort_values(["symbol", "date"], ascending=[True, False])
     latest = df.groupby("symbol").head(1).reset_index(drop=True)
-
     return latest
 
 
 # -------------------------------------------------
-# Screener base (PARCHADO: filtramos sólo large cap)
+# Screener base (filtramos sólo large cap, >=10B USD)
 # -------------------------------------------------
-def run_screener_for_exchange(exchange: str,
-                              min_mktcap: float = 1e10) -> List[Dict[str, Any]]:
+def run_screener_for_exchange(
+    exchange: str,
+    min_mktcap: float = 1e10
+) -> List[Dict[str, Any]]:
     """
-    Usa el stock screener de FMP con nuestros filtros base.
-    Cambia sólo 'exchange' entre NASDAQ / NYSE / AMEX.
-    PARCHADO: aplicamos filtro de large cap (>= 10B USD).
-
-    Devuelve lista[dict] ya filtrada.
-    Cada dict incluye {symbol, companyName, sector, industry, price, marketCap, exchange, ...}
+    Usa el screener de FMP con filtros base desde SCREENER_PARAMS.
+    Forzamos:
+      - exchange (NYSE / NASDAQ / AMEX)
+      - isActivelyTrading=true
+      - limit grande (5000)
+    Luego filtramos marketCap >= 10B USD.
+    Devuelve list[dict] con cada empresa.
     """
     params = dict(SCREENER_PARAMS)
-    # forzamos el exchange que queremos consultar
     params["exchange"] = exchange
-    # aseguramos activo
     params["isActivelyTrading"] = "true"
-    # tratamos de traer hartos de una vez
     if "limit" not in params:
         params["limit"] = 5000
 
     raw = _get("/stock-screener", params=params)
-
     if raw is None:
-        return []
+        raw = []
+    if isinstance(raw, dict):
+        # a veces FMP responde dict cuando le pasas 1 símbolo, normalizamos igual
+        raw = [raw]
 
     out: List[Dict[str, Any]] = []
     for row in raw:
-        # marketCap puede venir como string / None
         mc = row.get("marketCap")
         try:
             mc_val = float(mc)
@@ -128,40 +158,37 @@ def run_screener_for_exchange(exchange: str,
 # -------------------------------------------------
 # Financial Scores API (Altman Z, Piotroski)
 # -------------------------------------------------
-def get_financial_scores_batch(symbols: List[str],
-                               batch_size: int = 50,
-                               sleep_s: float = 0.2) -> pd.DataFrame:
+def get_financial_scores_batch(
+    symbols: List[str],
+    batch_size: int = 50,
+    sleep_s: float = 0.2
+) -> pd.DataFrame:
     """
-    Para una lista de símbolos grande, llama a la API de 'Financial Scores'
-    en batches. Devuelve un DataFrame con al menos:
-      symbol, altmanZScore, piotroskiScore, workingCapital, totalAssets,
-      retainedEarnings, ebit, marketCap, totalLiabilities, revenue
+    Para una lista grande de tickers:
+      - Llama al endpoint de scores en batches.
+      - Devuelve DF con columnas:
+        symbol, altmanZScore, piotroskiScore, ...
+      - Filtra calidad básica:
+        altmanZScore >= 3
+        piotroskiScore >= 7
 
-    IMPORTANTE:
-    - AJUSTA el endpoint según tu plan FMP. Ejemplo típico:
-      "/financial-score" o "/score".
-    - Este código asume que el endpoint ACEPTA batch con
-      symbol=AAPL,MSFT,GOOGL,...
-
-    Además aplicamos filtro de calidad:
-      altmanZScore >= 3
-      piotroskiScore >= 7
+    NOTA IMPORTANTE:
+    Ajusta el endpoint si tu plan FMP usa un path distinto.
+    Aquí asumimos "/financial-score" que acepta symbol="AAPL,MSFT,..."
     """
     rows_all: List[Dict[str, Any]] = []
 
-    # batch loop
     for i in range(0, len(symbols), batch_size):
-        chunk = symbols[i:i + batch_size]
-        params = {
-            "symbol": ",".join(chunk)
-        }
+        chunk = symbols[i : i + batch_size]
+        if not chunk:
+            continue
 
-        # <-- ajusta endpoint exacto si en tu cuenta es distinto
+        params = {"symbol": ",".join(chunk)}
+
         raw = _get("/financial-score", params=params)
 
         if raw is None:
             raw = []
-
         if isinstance(raw, dict):
             raw = [raw]
 
@@ -199,40 +226,38 @@ def get_financial_scores_batch(symbols: List[str],
 
 
 # -------------------------------------------------
-# Financial Statement Growth API (crecimiento / deuda)
+# Financial Statement Growth API (crecimiento / deuda / CAGR compuesto)
 # -------------------------------------------------
-def get_growth_batch(symbols: List[str],
-                     batch_size: int = 20,
-                     sleep_s: float = 0.3) -> pd.DataFrame:
+def get_growth_batch(
+    symbols: List[str],
+    batch_size: int = 20,
+    sleep_s: float = 0.3
+) -> pd.DataFrame:
     """
-    Para una lista de símbolos (idealmente ya filtrados por calidad),
-    llama al endpoint de crecimiento (Financial Statement Growth).
-    Devuelve sólo el último FY por símbolo, con métricas de crecimiento.
+    Para tickers ya filtrados por calidad:
+      - Llama al endpoint de growth en batches.
+      - Devuelve sólo el último FY por symbol.
+      - Calcula flags de disciplina (deuda no creciendo, etc.).
+      - Calcula CAGR 3y/5y en revenue y OCF por acción.
+      - Se queda sólo con las que tienen >15% CAGR en al menos una métrica.
 
-    IMPORTANTE:
-    - Ajusta el endpoint exacto; en FMP suele ser algo como
-      "/financial-statement-growth".
-    - Asumimos que acepta batch: symbol=AAPL,MSFT,...&period=annual
-
-    Filtros de salud que vamos a necesitar río arriba:
-      revenueGrowth >= 0
-      ebitgrowth >= 0
-      operatingCashFlowGrowth >= 0
-      freeCashFlowGrowth >= 0
-      debtGrowth <= 0
-
-    También calcularemos CAGR 3y/5y para revenue y OCF por acción.
+    NOTA IMPORTANTE:
+    Ajusta el endpoint según tu plan. Aquí asumimos:
+      "/financial-statement-growth"
+    con params {"symbol": "...", "period": "annual"} aceptando batch.
     """
     parts: List[pd.DataFrame] = []
 
     for i in range(0, len(symbols), batch_size):
-        chunk = symbols[i:i + batch_size]
+        chunk = symbols[i : i + batch_size]
+        if not chunk:
+            continue
+
         params = {
             "symbol": ",".join(chunk),
-            "period": "annual"
+            "period": "annual",
         }
 
-        # <-- ajusta endpoint si tu contrato usa otro path
         raw = _get("/financial-statement-growth", params=params)
         df_chunk = _to_df(raw)
         if df_chunk.empty:
@@ -241,7 +266,6 @@ def get_growth_batch(symbols: List[str],
 
         latest = _latest_fy_per_symbol(df_chunk)
         parts.append(latest)
-
         time.sleep(sleep_s)
 
     if not parts:
@@ -269,7 +293,6 @@ def get_growth_batch(symbols: List[str],
             df_growth[c] = None
     df_growth = df_growth[needed_cols]
 
-    # pasar a numérico
     num_cols = [
         "revenueGrowth",
         "ebitgrowth",
@@ -284,7 +307,7 @@ def get_growth_batch(symbols: List[str],
     for c in num_cols:
         df_growth[c] = pd.to_numeric(df_growth[c], errors="coerce")
 
-    # filtros de salud / disciplina financiera
+    # Filtros disciplina financiera a 12m:
     healthy = df_growth[
         (df_growth["revenueGrowth"] >= 0) &
         (df_growth["ebitgrowth"] >= 0) &
@@ -293,10 +316,13 @@ def get_growth_batch(symbols: List[str],
         (df_growth["debtGrowth"] <= 0)
     ].copy()
 
-    # ---- calcular CAGR compuesto (~15%) ----
+    # CAGR helper
     def _cagr(g_mult, yrs: int):
-        # g_mult = 0.8093 significa +80.93%, o sea 1.8093x en 5y
-        # CAGR = (1 + g_mult)**(1/yrs) - 1
+        """
+        g_mult se interpreta como crecimiento acumulado:
+        ej. 0.80 => +80% total en ~5y -> factor 1.80
+        CAGR = (1 + g_mult)**(1/yrs) - 1
+        """
         try:
             base = 1.0 + float(g_mult)
             if base <= 0:
@@ -318,7 +344,7 @@ def get_growth_batch(symbols: List[str],
         lambda g: _cagr(g, 3)
     )
 
-    def _meets_15pct(row):
+    def _meets_15pct(row: pd.Series) -> bool:
         for key in [
             "rev_CAGR_5y",
             "rev_CAGR_3y",
@@ -332,125 +358,215 @@ def get_growth_batch(symbols: List[str],
 
     healthy["high_growth_flag"] = healthy.apply(_meets_15pct, axis=1)
 
-    # nos quedamos sólo con las de crecimiento compuesto >=15% en revenue/OCF por acción
     elite = healthy[healthy["high_growth_flag"]].reset_index(drop=True)
 
     return elite
 
 
 # -------------------------------------------------
-# Funciones legacy que ya tenías (se mantienen)
+# Funciones "unitarias" (1 ticker) legacy
 # -------------------------------------------------
 def get_ratios(ticker: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Ratios financieros históricos (ROE, margen, etc.).
-    Típicamente newest first [0] = más reciente.
+    Ratios financieros históricos (ROE, márgenes, etc.).
+    newest first (más reciente primero).
     """
-    return _get(f"/ratios/{ticker}", {"limit": limit})
+    out = _get(f"/ratios/{ticker}", {"limit": limit, "period": "annual"})
+    if isinstance(out, dict):
+        out = [out]
+    return out
 
 
 def get_income_statement(ticker: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Income statement anual.
+    Income statement anual (más reciente primero).
     """
-    return _get(f"/income-statement/{ticker}", {
+    out = _get(f"/income-statement/{ticker}", {
         "period": "annual",
         "limit": limit
     })
+    if isinstance(out, dict):
+        out = [out]
+    return out
 
 
 def get_balance_sheet(ticker: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Balance sheet anual.
+    Balance sheet anual (más reciente primero).
     """
-    return _get(f"/balance-sheet-statement/{ticker}", {
+    out = _get(f"/balance-sheet-statement/{ticker}", {
         "period": "annual",
         "limit": limit
     })
+    if isinstance(out, dict):
+        out = [out]
+    return out
 
 
 def get_cash_flow(ticker: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Cash flow statement anual.
+    Cash flow statement anual (más reciente primero).
     """
-    return _get(f"/cash-flow-statement/{ticker}", {
+    out = _get(f"/cash-flow-statement/{ticker}", {
         "period": "annual",
         "limit": limit
     })
+    if isinstance(out, dict):
+        out = [out]
+    return out
 
 
 def get_profile(ticker: str) -> List[Dict[str, Any]]:
     """
     Profile de la empresa: descripción, sector, industry,
     marketCap, price, beta, etc.
-    Devuelve lista con un dict normalmente.
+    Devuelve normalmente una lista con un dict.
     """
-    return _get(f"/profile/{ticker}")
+    out = _get(f"/profile/{ticker}")
+    if isinstance(out, dict):
+        out = [out]
+    if out is None:
+        out = []
+    return out
 
 
 def get_insider_trading(ticker: str, limit: int = 50) -> List[Dict[str, Any]]:
     """
-    Transacciones de insiders (directores/ejecutivos).
+    Transacciones de insiders.
     """
-    return _get("/insider-trading", {
+    out = _get("/insider-trading", {
         "symbol": ticker,
         "limit": limit
     })
+    if isinstance(out, dict):
+        out = [out]
+    if out is None:
+        out = []
+    return out
 
 
 def get_news(ticker: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
-    Noticias recientes sobre el ticker.
-    Retorna lista con {title, text, publishedDate, ...}
+    Noticias recientes del ticker.
     """
-    return _get("/stock_news", {
+    out = _get("/stock_news", {
         "tickers": ticker,
         "limit": limit
     })
+    if isinstance(out, dict):
+        out = [out]
+    if out is None:
+        out = []
+    return out
 
 
 def get_earnings_call_transcript(ticker: str, limit: int = 1) -> List[Dict[str, Any]]:
     """
-    Últimas transcripciones de conference calls (earnings call).
-    Incluye Q&A, guía de management, etc.
+    Últimas transcripciones de earnings call (con Q&A y guía).
     """
-    return _get(f"/earning_call_transcript/{ticker}", {
+    out = _get(f"/earning_call_transcript/{ticker}", {
         "limit": limit
     })
+    if isinstance(out, dict):
+        out = [out]
+    if out is None:
+        out = []
+    return out
+
+
+# -------------------------------------------------
+# Históricos anuales para construir tendencias (1 ticker)
+# Estos se usan para slope FCF/acción, buybacks %, net debt, etc.
+# -------------------------------------------------
+def _safe_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Devuelve sólo las columnas pedidas si existen, sin romper."""
+    existing = [c for c in cols if c in df.columns]
+    if not existing:
+        # devolvemos df vacío con esas columnas para consistencia
+        return pd.DataFrame(columns=cols)
+    return df[existing].copy()
+
 
 def get_cashflow_history(symbol: str) -> pd.DataFrame:
-    data = _get(f"/cash-flow-statement/{symbol}", params={"period": "annual", "limit": 5})
-    df = pd.DataFrame(data)
-    # normalizamos nombres a los que vamos a usar
-    return df.rename(columns={
-        "date": "fiscalDate",
-        "operatingCashFlow": "operatingCashFlow",
-        "capitalExpenditure": "capitalExpenditure"
-    })[["fiscalDate", "operatingCashFlow", "capitalExpenditure"]]
+    """
+    Devuelve DataFrame anual con:
+      fiscalDate, operatingCashFlow, capitalExpenditure
+    """
+    raw = _get(f"/cash-flow-statement/{symbol}", {
+        "period": "annual",
+        "limit": 5
+    })
+    df = _to_df(raw).copy()
+    # Renombramos y normalizamos
+    if "date" in df.columns and "fiscalDate" not in df.columns:
+        df["fiscalDate"] = df["date"]
+    cols = [
+        "fiscalDate",
+        "operatingCashFlow",
+        "capitalExpenditure",
+    ]
+    return _safe_cols(df, cols)
+
 
 def get_balance_history(symbol: str) -> pd.DataFrame:
-    data = _get(f"/balance-sheet-statement/{symbol}", params={"period": "annual", "limit": 5})
-    df = pd.DataFrame(data)
-    return df.rename(columns={
-        "date": "fiscalDate",
-        "totalDebt": "totalDebt",
-        "cashAndShortTermInvestments": "cashAndShortTermInvestments"
-    })[["fiscalDate", "totalDebt", "cashAndShortTermInvestments"]]
+    """
+    Devuelve DataFrame anual con:
+      fiscalDate, totalDebt, cashAndShortTermInvestments
+    """
+    raw = _get(f"/balance-sheet-statement/{symbol}", {
+        "period": "annual",
+        "limit": 5
+    })
+    df = _to_df(raw).copy()
+    if "date" in df.columns and "fiscalDate" not in df.columns:
+        df["fiscalDate"] = df["date"]
+    cols = [
+        "fiscalDate",
+        "totalDebt",
+        "cashAndShortTermInvestments",
+    ]
+    return _safe_cols(df, cols)
+
 
 def get_income_history(symbol: str) -> pd.DataFrame:
-    data = _get(f"/income-statement/{symbol}", params={"period": "annual", "limit": 5})
-    df = pd.DataFrame(data)
-    return df.rename(columns={
-        "date": "fiscalDate",
-        "ebitda": "ebitda",
-        "revenue": "revenue"
-    })[["fiscalDate", "ebitda", "revenue"]]
+    """
+    Devuelve DataFrame anual con:
+      fiscalDate, ebitda, revenue
+    """
+    raw = _get(f"/income-statement/{symbol}", {
+        "period": "annual",
+        "limit": 5
+    })
+    df = _to_df(raw).copy()
+    if "date" in df.columns and "fiscalDate" not in df.columns:
+        df["fiscalDate"] = df["date"]
+    cols = [
+        "fiscalDate",
+        "ebitda",
+        "revenue",
+    ]
+    return _safe_cols(df, cols)
+
 
 def get_shares_history(symbol: str) -> pd.DataFrame:
-    # FMP tiene /shares_float/{symbol} o viene en income-statement como weightedAverageShsOutDil
-    data = _get(f"/income-statement/{symbol}", params={"period": "annual", "limit": 5})
-    df = pd.DataFrame(data)
-    return df.rename(columns={
-        "date": "fiscalDate",
-        "weightedAverageShsOutDil": "sharesDiluted"
-    })[["fiscalDate", "sharesDiluted"]]
+    """
+    FMP entrega las acciones diluidas promedio en el income statement anual
+    (weightedAverageShsOutDil). La exponemos como sharesDiluted por año.
+    """
+    raw = _get(f"/income-statement/{symbol}", {
+        "period": "annual",
+        "limit": 5
+    })
+    df = _to_df(raw).copy()
+    if "date" in df.columns and "fiscalDate" not in df.columns:
+        df["fiscalDate"] = df["date"]
+
+    # renombrar weightedAverageShsOutDil -> sharesDiluted
+    if "weightedAverageShsOutDil" in df.columns and "sharesDiluted" not in df.columns:
+        df["sharesDiluted"] = df["weightedAverageShsOutDil"]
+
+    cols = [
+        "fiscalDate",
+        "sharesDiluted",
+    ]
+    return _safe_cols(df, cols)
