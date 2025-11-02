@@ -4,7 +4,7 @@ import pandas as pd
 
 from config import MAX_NET_DEBT_TO_EBITDA
 
-# FMP accessors que ya tienes en fmp_api.py
+# --- llamadas a FMP que ya tienes en fmp_api.py ---
 from fmp_api import (
     run_screener_for_exchange,
     get_profile,
@@ -18,7 +18,13 @@ from fmp_api import (
     get_earnings_call_transcript,
 )
 
+# métrica cuantitativa consolidada (tu metrics.py nuevo expone esto)
 from metrics import compute_core_metrics
+
+
+# ===============================
+# Helpers internos
+# ===============================
 
 EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]
 
@@ -37,11 +43,8 @@ def _is_large_cap_row(row: Dict[str, Any], min_mktcap: float = 10_000_000_000) -
 
 def _normalize_chunk_to_df(chunk) -> pd.DataFrame:
     """
-    Asegura que run_screener_for_exchange(...) termine siendo DataFrame.
-    Soporta:
-      - list[dict]
-      - dict con key "data"
-      - DataFrame
+    Asegura que run_screener_for_exchange(...) termine siendo DataFrame,
+    aunque FMP a veces responda lista o dict raro.
     """
     if chunk is None:
         return pd.DataFrame()
@@ -53,20 +56,26 @@ def _normalize_chunk_to_df(chunk) -> pd.DataFrame:
         return pd.DataFrame(chunk)
 
     if isinstance(chunk, dict):
-        # caso tipo {"data":[...]}
+        # caso {"data":[...]}
         if "data" in chunk and isinstance(chunk["data"], list):
             return pd.DataFrame(chunk["data"])
-        # caso dict plano con info de 1 ticker
+        # caso dict simple (1 fila)
         return pd.DataFrame([chunk])
 
     # fallback
     return pd.DataFrame()
 
 
+# ===============================
+# 1. Universo large cap
+# ===============================
+
 def build_universe() -> pd.DataFrame:
     """
-    Une los screeners de cada exchange, normaliza columnas,
-    filtra solo large caps y devuelve symbol, companyName, sector, industry, marketCap.
+    Une screeners de cada exchange, limpia columnas,
+    filtra solo large caps.
+    Devuelve columnas mínimas:
+    symbol, companyName, sector, industry, marketCap
     """
     frames: List[pd.DataFrame] = []
 
@@ -89,7 +98,7 @@ def build_universe() -> pd.DataFrame:
 
     uni = pd.concat(frames, ignore_index=True)
 
-    # renombrar name -> companyName si es necesario
+    # renombrar 'name' -> 'companyName' si hace falta
     if "companyName" not in uni.columns and "name" in uni.columns:
         uni = uni.rename(columns={"name": "companyName"})
 
@@ -102,7 +111,7 @@ def build_universe() -> pd.DataFrame:
         if "marketCap" not in uni.columns:
             uni["marketCap"] = None
 
-    # limpiar duplicados
+    # dedupe
     uni = (
         uni.drop_duplicates(subset=["symbol"])
            .reset_index(drop=True)
@@ -112,7 +121,7 @@ def build_universe() -> pd.DataFrame:
     mask_large = uni.apply(_is_large_cap_row, axis=1)
     uni = uni[mask_large].reset_index(drop=True)
 
-    # columnas mínimas
+    # columnas mínimas garantizadas
     for col in ["symbol", "companyName", "sector", "industry", "marketCap"]:
         if col not in uni.columns:
             uni[col] = None
@@ -120,12 +129,14 @@ def build_universe() -> pd.DataFrame:
     return uni[["symbol", "companyName", "sector", "industry", "marketCap"]].copy()
 
 
+# ===============================
+# 2. Snapshot de UNA empresa
+# ===============================
+
 def build_company_row(symbol: str) -> Dict[str, Any] | None:
     """
-    Para un ticker:
-    - Descarga los estados financieros crudos (histórico anual).
-    - Llama compute_core_metrics(...) para consolidar todo.
-    - Devuelve un dict con todas las llaves que app.py y dataframe_from_rows() esperan.
+    Descarga estados financieros crudos para un ticker
+    y arma el diccionario consolidado que la app espera.
     """
     try:
         profile      = get_profile(symbol) or {}
@@ -137,7 +148,7 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
     except Exception:
         return None
 
-    # sanity mínimo: necesitamos al menos 2 años para calcular growth
+    # si no hay data histórica mínima, salimos
     if len(income_hist) < 2 or len(cash_hist) < 2 or len(balance_hist) < 2:
         return None
 
@@ -151,8 +162,9 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
         shares_hist=shares_hist,
     )
 
-    # fila final coherente con app.py/dataframe_from_rows()
+    # devolvemos con las llaves que usa app.py/dataframe_from_rows()
     return {
+        # identidad
         "ticker": core["ticker"],
         "name": core["name"] or core["ticker"],
         "companyName": core["name"] or core["ticker"],
@@ -160,24 +172,32 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
         "industry": core["industry"],
         "marketCap": core["marketCap"],
 
+        # scores de calidad/solvencia
         "altmanZScore": core["altmanZScore"],
         "piotroskiScore": core["piotroskiScore"],
 
+        # crecimiento último año
         "revenueGrowth": core["revenueGrowth"],
         "operatingCashFlowGrowth": core["operatingCashFlowGrowth"],
         "freeCashFlowGrowth": core["freeCashFlowGrowth"],
         "debtGrowth": core["debtGrowth"],
 
+        # CAGR multianual
         "rev_CAGR_5y": core["rev_CAGR_5y"],
         "ocf_CAGR_5y": core["ocf_CAGR_5y"],
 
+        # apalancamiento
         "netDebt_to_EBITDA": core["netDebt_to_EBITDA"],
 
+        # capital allocation / compounding
         "buyback_pct_5y": core["buyback_pct_5y"],
         "fcf_per_share_slope_5y": core["fcf_per_share_slope_5y"],
         "is_quality_compounder": core["is_quality_compounder"],
 
+        # moat heurístico
         "moat_flag": core["moat_flag"],
+
+        # descripción corta del negocio
         "business_summary": core["business_summary"],
 
         # series históricas para Tab2
@@ -188,11 +208,15 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
     }
 
 
+# ===============================
+# 3. Shortlist de TODO el mercado (Tab1)
+# ===============================
+
 def build_market_snapshot() -> List[Dict[str, Any]]:
     """
-    1. arma universo large cap
-    2. recorre cada symbol
-    3. junta las filas válidas
+    - arma universo large cap
+    - para cada symbol construye una fila
+    - devuelve lista[dict] (la app después la convierte a DataFrame bonito)
     """
     uni = build_universe()
     out: List[Dict[str, Any]] = []
@@ -206,27 +230,53 @@ def build_market_snapshot() -> List[Dict[str, Any]]:
         if snap is None:
             continue
 
-        # (opcional) podríamos filtrar por apalancamiento aquí con MAX_NET_DEBT_TO_EBITDA,
-        # pero no es obligatorio porque la UI igual aplica el slider leverage_ok.
+        # opcional: si quisieras filtrar empresas ultra apalancadas acá,
+        # podrías mirar snap["netDebt_to_EBITDA"] contra MAX_NET_DEBT_TO_EBITDA.
         out.append(snap)
 
     return out
 
 
+# ===============================
+# 4. Snapshot de tu watchlist (arriba en la app)
+# ===============================
+
+def build_full_snapshot(symbols: List[str]) -> pd.DataFrame:
+    """
+    Recibe ['AAPL','MSFT',...] y retorna un DataFrame
+    con las mismas columnas que usa la grilla de la app.
+    Esto es EXACTAMENTE lo que app.py espera para la watchlist.
+    """
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        snap = build_company_row(sym)
+        if snap is not None:
+            rows.append(snap)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+# ===============================
+# 5. Enriquecer 1 empresa (Tab2 cualitativo)
+# ===============================
+
 def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Enriquecimiento cualitativo para Tab2.
-    Este paso usa insiders, noticias y earnings call,
-    y hace resúmenes de texto.
+    Agrega señales cualitativas para el panel detalle:
+    insiders, sentimiento de prensa y resumen de la earnings call.
 
+    IMPORTANTE:
     Hacemos import local de text_analysis para no romper el import global.
-    Si text_analysis falla, devolvemos defaults y seguimos.
+    Si text_analysis falla, metemos defaults neutros.
     """
     symbol = base_row.get("ticker") or base_row.get("symbol")
     if not symbol:
         return base_row
 
-    # intentamos importar análisis de texto acá adentro
+    # import perezoso para evitar que la app explote al levantar
     try:
         from text_analysis import (
             summarize_business,
@@ -236,9 +286,15 @@ def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
         )
     except Exception:
         summarize_business = lambda prof_or_desc: base_row.get("business_summary", "")
-        summarize_news_sentiment = lambda news: ("neutral", "tono mixto/sectorial")
-        summarize_insiders = lambda insider: ("neutral", "")
-        summarize_transcript = lambda txt: "Sin señales fuertes en la última call."
+        summarize_news_sentiment = (
+            lambda news: ("neutral", "tono mixto/sectorial")
+        )
+        summarize_insiders = (
+            lambda insider: ("neutral", "")
+        )
+        summarize_transcript = (
+            lambda txt: "Sin señales fuertes en la última call."
+        )
 
     # insiders
     try:
@@ -270,7 +326,7 @@ def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
         transcript_summary or "Sin señales fuertes en la última call."
     )
 
-    # Si no teníamos resumen de negocio legible, lo intentamos generar
+    # si business_summary venía vacío, intentamos fabricarlo
     if not enriched.get("business_summary"):
         enriched["business_summary"] = summarize_business(
             {"description": base_row.get("business_summary", "")}
