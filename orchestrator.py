@@ -473,65 +473,96 @@ def enrich_universe_with_fundamentals(
 
 def build_market_snapshot() -> list[dict]:
     """
-    1. Saca universo (NYSE/NASDAQ/AMEX filtrado por marketCap >=10B)
-    2. Para cada ticker arma snapshot core + fundamentals
-    3. Devuelve lista de dicts listos para la UI
+    Devuelve una lista de dicts, uno por ticker 'grande y sano'.
+    Cada dict ya trae:
+      - datos de universo (nombre, sector, marketCap, etc.)
+      - métricas core fundamentales (altmanZScore, piotroskiScore, growth, etc.)
+      - bloque compounder/fcf_yield/buybacks/etc.
+    Esta lista es lo que guardamos en st.session_state["snapshot_rows"].
     """
-    uni = build_universe()
 
-    # quedarnos solo con large caps
-    uni = uni[uni["marketCap"].astype(float) >= 10_000_000_000].copy()
-    uni = uni.reset_index(drop=True)
+    # 1. universo bruto desde screener
+    universe_df = build_universe().reset_index(drop=True)
+
+    # asegurarnos que al menos tenemos columnas clave
+    needed_cols_universe = [
+        "symbol",
+        "companyName",
+        "name",
+        "sector",
+        "industry",
+        "marketCap",
+    ]
+    for c in needed_cols_universe:
+        if c not in universe_df.columns:
+            universe_df[c] = None
+
+    # 2. lista de tickers candidatos (large caps)
+    symbols = (
+        universe_df["symbol"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    # 3. fundamentals masivos (buybacks, slope fcf/accion, deuda neta, fcf_yield, ev/ebitda...)
+    fund_block_df = build_fundamentals_block(symbols)
+    # para facilitar búsqueda rápida por símbolo:
+    fund_block_df = fund_block_df.set_index("symbol")
 
     rows_out: list[dict] = []
 
-    for _, row in uni.iterrows():
-        ticker = row["symbol"]
+    # 4. loop ticker a ticker
+    for _, base_row in universe_df.iterrows():
+        sym = str(base_row.get("symbol", "")).strip()
+        if not sym:
+            continue
 
+        # --- core snapshot fundamental individual ---
         try:
-            # bloque fundamental profundo que construimos más arriba
-            core_block = build_company_core_snapshot(ticker)
+            core = build_company_core_snapshot(sym)
+            # core es un dict con altmanZScore, piotroskiScore, growth, netDebt_to_EBITDA, etc.
         except Exception:
-            continue  # si una se cae, seguimos con la otra
+            core = {}
 
-        # metemos algunas columnas básicas del screener (para que no se pierdan)
-        core_block["ticker"]   = ticker
-        core_block["name"]     = row.get("companyName") or row.get("companyName", ticker)
-        core_block["companyName"] = row.get("companyName", ticker)
-        core_block["sector"]   = row.get("sector")
-        core_block["industry"] = row.get("industry")
-        core_block["marketCap"] = row.get("marketCap")
-
-        # merge con bloque de métricas largas tipo buybacks / fcf slope, etc.
+        # --- bloque fundamentals (buybacks etc.) para este símbolo ---
         try:
-            fundamentals_extra = fetch_fundamentals_for_symbol(ticker)
+            fblk = (
+                fund_block_df.loc[sym].to_dict()
+                if sym in fund_block_df.index
+                else {}
+            )
         except Exception:
-            fundamentals_extra = {}
-        core_block.update(fundamentals_extra)
+            fblk = {}
 
-        # bandera moat / moat_flag heurística (si no la estamos calculando aún)
-        core_block.setdefault("moat_flag", "—")
+        # --- merge TODO para este ticker ---
+        snap: dict = {}
 
-        # -------------------------------------------------
-        # PARCHE: rellenar Altman Z y Piotroski si vienen None
-        # -------------------------------------------------
-        altman = core_block.get("altmanZScore")
-        pio    = core_block.get("piotroskiScore")
+        # a) info base de universo
+        snap["ticker"]        = sym
+        snap["name"]          = base_row.get("companyName") or base_row.get("name") or sym
+        snap["sector"]        = base_row.get("sector")
+        snap["industry"]      = base_row.get("industry")
+        snap["marketCap"]     = base_row.get("marketCap")
 
-        compounder_flag = core_block.get("is_quality_compounder", False)
+        # b) métricas core fundamentales (altmanZScore, piotroskiScore, growths...)
+        #    copiamos campo a campo para evitar arrastrar refs mutables
+        for k, v in core.items():
+            snap[k] = v
 
-        if altman is None or (isinstance(altman, float) and math.isnan(altman)):
-            core_block["altmanZScore"] = 3.0 if compounder_flag else 2.0
+        # c) metrics de compounder / buybacks / deuda / valoración
+        for k, v in fblk.items():
+            snap[k] = v
 
-        if pio is None or (isinstance(pio, float) and math.isnan(pio)):
-            core_block["piotroskiScore"] = 8 if compounder_flag else 5
+        # d) banderas heurísticas de moat / por qué importa, etc.
+        #    (a futuro las rellenamos cuando metas heurísticas cualitativas)
+        if "moat_flag" not in snap:
+            snap["moat_flag"] = None
 
-        # guardamos
-        rows_out.append(core_block)
+        rows_out.append(snap)
 
-    # devolvemos toda la lista, que luego app.py pone en session_state
     return rows_out
-
 
 
 # ============================================================
