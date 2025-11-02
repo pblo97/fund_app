@@ -6,10 +6,11 @@ import matplotlib.pyplot as plt
 
 from config import MAX_NET_DEBT_TO_EBITDA
 from orchestrator import (
+    build_full_snapshot,
     build_market_snapshot,
-    build_company_core_snapshot,
     enrich_company_snapshot,
 )
+
 # -------------------------------------------------
 # Helpers de formato
 # -------------------------------------------------
@@ -56,13 +57,12 @@ def _ensure_list(v):
 
 def dataframe_from_rows(rows: list[dict], max_leverage: float):
     """
-    Normaliza las filas crudas (dicts que vienen de build_market_snapshot /
-    enrich_company_snapshot) en un DataFrame con todas las columnas que
-    la UI espera, y además agrega columnas formateadas para mostrar.
+    Toma la lista de dicts que produce build_market_snapshot()
+    y arma un DataFrame homogéneo + columnas formateadas para UI.
     """
     df = pd.DataFrame(rows).copy()
 
-    # columnas mínimas que la UI espera ver
+    # columnas mínimas que tratamos de asegurar (muchas vendrán ya del orchestrator)
     needed = [
         "ticker",
         "name",
@@ -80,38 +80,43 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         "debtGrowth",
 
         "rev_CAGR_5y",
-        "rev_CAGR_3y",
         "ocf_CAGR_5y",
+
+        # opcionales en la versión nueva: podríamos no tenerlas
+        "rev_CAGR_3y",
         "ocf_CAGR_3y",
 
         "netDebt_to_EBITDA",
-        "net_debt_to_ebitda_last",
+        "net_debt_to_ebitda_last",  # puede venir None en la versión nueva
 
         "fcf_per_share_slope_5y",
         "buyback_pct_5y",
         "is_quality_compounder",
         "moat_flag",
+
+        "years",
+        "fcf_per_share_hist",
+        "shares_hist",
+        "net_debt_hist",
     ]
     for col in needed:
         if col not in df.columns:
             df[col] = None
 
-    # Rellenar "name" usando "companyName" si viene vacío
+    # si name está vacío, usamos companyName
     if "name" in df.columns and "companyName" in df.columns:
         df["name"] = df["name"].fillna(df["companyName"])
 
-    # Elegimos la métrica final de apalancamiento
+    # ---- apalancamiento efectivo ----
     def _pick_nde(row):
         cand1 = row.get("net_debt_to_ebitda_last")
         cand2 = row.get("netDebt_to_EBITDA")
-        # preferimos nuestra métrica calculada (cand1)
         if cand1 is not None and not (isinstance(cand1, float) and math.isnan(cand1)):
             return cand1
         return cand2
 
     df["netDebt_to_EBITDA_effective"] = df.apply(_pick_nde, axis=1)
 
-    # Flag leverage_ok según slider
     def _lev_ok(x):
         if x is None:
             return True
@@ -126,7 +131,7 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
 
     # ---------- FORMATTERS VISUALES ----------
 
-    # Net Debt / EBITDA formateado
+    # Net Debt / EBITDA
     df["netDebt_to_EBITDA_fmt"] = df["netDebt_to_EBITDA_effective"].apply(
         lambda x: (
             "—"
@@ -135,10 +140,10 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         )
     )
 
-    # Market cap "bonito"
+    # MarketCap bonito
     df["marketCap_fmt"] = df["marketCap"].apply(_fmt_num)
 
-    # Altman / Piotroski formateados
+    # Altman / Piotroski
     df["altmanZScore_fmt"] = df["altmanZScore"].apply(
         lambda x: (
             "—"
@@ -155,13 +160,13 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
         )
     )
 
-    # Crecimientos últimos 12m
+    # crecimiento último FY
     df["revenueGrowth_pct"] = df["revenueGrowth"].apply(_fmt_pct)
     df["ocfGrowth_pct"] = df["operatingCashFlowGrowth"].apply(_fmt_pct)
     df["fcfGrowth_pct"] = df["freeCashFlowGrowth"].apply(_fmt_pct)
     df["debtGrowth_pct"] = df["debtGrowth"].apply(_fmt_pct)
 
-    # CAGR multianual
+    # CAGR multianual disponible
     df["rev_CAGR_5y_pct"] = df["rev_CAGR_5y"].apply(_fmt_pct)
     df["ocf_CAGR_5y_pct"] = df["ocf_CAGR_5y"].apply(_fmt_pct)
 
@@ -175,10 +180,10 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
     else:
         df["ocf_CAGR_3y_pct"] = "—"
 
-    # recompras (% reducción acciones en ~5y)
+    # recompras /5y
     df["buyback_pct_5y_fmt"] = df["buyback_pct_5y"].apply(_fmt_pct)
 
-    # slope del FCF/acción
+    # slope FCF/acción
     def _fmt_slope(val):
         if val is None:
             return "—"
@@ -191,7 +196,7 @@ def dataframe_from_rows(rows: list[dict], max_leverage: float):
 
     df["fcf_per_share_slope_5y_fmt"] = df["fcf_per_share_slope_5y"].apply(_fmt_slope)
 
-    # tag de compounder
+    # etiqueta compounder
     def _fmt_compounder(flag):
         return "✅ COMPOUNDER" if flag is True else "—"
 
@@ -218,11 +223,11 @@ def render_detail_panel(row: pd.Series):
         st.metric("Crec. OCF (últ. FY)", _fmt_pct(row.get("operatingCashFlowGrowth")))
         st.metric("Crec. FCF (últ. FY)", _fmt_pct(row.get("freeCashFlowGrowth")))
     with col3:
-        nde = row.get("netDebt_to_EBITDA")
+        nde = row.get("netDebt_to_EBITDA") or row.get("netDebt_to_EBITDA_effective")
         nde_fmt = (
             "—"
             if nde is None or (isinstance(nde, float) and math.isnan(nde))
-            else f"{nde:.2f}"
+            else f"{float(nde):.2f}"
         )
         st.metric("Net Debt / EBITDA", nde_fmt)
         st.metric("Deuda vs año prev.", _fmt_pct(row.get("debtGrowth")))
@@ -316,8 +321,7 @@ run_btn = st.sidebar.button("🚀 Run Screening / Refresh Data")
 # -------------------------------------------------
 
 if "snapshot_rows" not in st.session_state:
-    # shortlist global del mercado (Tab1/Tab2)
-    st.session_state["snapshot_rows"] = []
+    st.session_state["snapshot_rows"] = []  # shortlist global (Tab1/Tab2)
 
 if "last_error" not in st.session_state:
     st.session_state["last_error"] = None
@@ -326,10 +330,6 @@ if "kept" not in st.session_state:
     # tu watchlist manual
     st.session_state["kept"] = pd.DataFrame(columns=["symbol"])
 
-
-# -------------------------------------------------
-# WATCHLIST ENRIQUECIDA (arriba de todo)
-# -------------------------------------------------
 
 # -------------------------------------------------
 # WATCHLIST ENRIQUECIDA (arriba de todo)
@@ -345,15 +345,12 @@ kept_syms = (
     else []
 )
 
-watch_rows = []
 if kept_syms:
-    for sym in kept_syms:
-        snap = build_company_core_snapshot(sym)
-        if snap is not None:
-            watch_rows.append(snap)
-
-if watch_rows:
-    final_df_watchlist = pd.DataFrame(watch_rows)
+    try:
+        final_df_watchlist = build_full_snapshot(kept_syms)
+    except Exception as e:
+        final_df_watchlist = pd.DataFrame()
+        st.warning(f"No pude enriquecer tu watchlist: {e}")
 else:
     final_df_watchlist = pd.DataFrame()
 
@@ -367,7 +364,7 @@ if not final_df_watchlist.empty:
         "marketCap",
         "fcf_per_share_slope_5y",
         "buyback_pct_5y",
-        "net_debt_to_ebitda_last",
+        "netDebt_to_EBITDA",
         "is_quality_compounder"
     ]
     cols_watch = [c for c in cols_watch if c in final_df_watchlist.columns]
@@ -380,13 +377,14 @@ if not final_df_watchlist.empty:
 else:
     st.info("Aún no hay watchlist enriquecida (no hay 'kept_syms').")
 
+
 # -------------------------------------------------
 # BOTÓN: construir shortlist global de mercado
 # -------------------------------------------------
 
 if run_btn:
     try:
-        rows = build_market_snapshot()  # <- viene de orchestrator.py
+        rows = build_market_snapshot()  # <- orquestador nuevo
         st.session_state["snapshot_rows"] = rows
         st.session_state["last_error"] = None
     except Exception as e:
@@ -395,7 +393,7 @@ if run_btn:
 
 rows_data = st.session_state["snapshot_rows"]
 
-# feedback lateral en sidebar
+# feedback lateral
 if st.session_state["last_error"]:
     st.sidebar.error(f"Error al armar shortlist: {st.session_state['last_error']}")
 else:
@@ -427,9 +425,9 @@ with tab1:
             "- Cap grande (≥10B USD)\n"
             "- Altman Z sano (bajo riesgo de quiebra)\n"
             "- Piotroski alto (calidad contable / eficiencia operativa)\n"
-            "- Crecimiento positivo en ventas, EBIT, OCF y FCF\n"
-            "- Deuda sin expandirse\n"
-            "- CAGR ≥15% en revenue/OCF por acción (3-5y)\n"
+            "- Crecimiento positivo en ventas, OCF y FCF\n"
+            "- Deuda sin dispararse\n"
+            "- CAGR ≥15% a 5y en revenue/OCF\n"
             "- Apalancamiento dentro de tu umbral de Net Debt / EBITDA"
         )
 
@@ -442,8 +440,8 @@ with tab1:
             "industry",
             "marketCap_fmt",
             "netDebt_to_EBITDA_fmt",
-            "buyback_pct_5y_fmt",            # % recompras últimos ~5y
-            "fcf_per_share_slope_5y_fmt",    # tendencia de FCF/acción
+            "buyback_pct_5y_fmt",            # recompras últimos ~5y
+            "fcf_per_share_slope_5y_fmt",    # tendencia FCF/acción
             "is_quality_compounder_fmt",     # ✅ COMPOUNDER / —
             "altmanZScore_fmt",
             "piotroskiScore_fmt",
@@ -468,9 +466,9 @@ with tab1:
 
         st.caption(
             "Lectura rápida:\n"
-            "- Altman Z ↑ y Piotroski ↑ = balance sólido + disciplina.\n"
+            "- Altman Z ↑ y Piotroski ↑ = balance sólido.\n"
             "- OCF/FCF creciendo y deuda controlada = caja real que escala sin apalancarse.\n"
-            "- CAGR ≥15% = potencial de componer valor a largo plazo.\n"
+            "- CAGR ≥15% = potencial de componer valor.\n"
             "- Net Debt/EBITDA bajo = resiliencia en estrés de liquidez."
         )
 
@@ -494,7 +492,6 @@ with tab2:
                 tickers_available
             )
 
-            # buscamos el dict original crudo de ese ticker
             base_core = next((r for r in rows_data if r.get("ticker") == picked), None)
             if base_core is None:
                 st.error("No encontré datos base de ese ticker.")
@@ -506,11 +503,7 @@ with tab2:
                 st.error(f"No pude completar el detalle cualitativo: {e}")
                 detailed = base_core.copy()
 
-            # normalizamos llaves esperadas por render_detail_panel
-            nde = detailed.get("netDebt_to_EBITDA")
-            if nde is None or (isinstance(nde, float) and math.isnan(nde)):
-                detailed["netDebt_to_EBITDA"] = None
-
+            # normalizar llaves esperadas
             defaults_needed = {
                 "transcript_summary": "Sin señales fuertes en la última call.",
                 "sector": base_core.get("sector", "—"),
