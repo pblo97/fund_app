@@ -1,46 +1,68 @@
 # orchestrator.py
 #
-# Flujo:
-# 1. build_universe() ->
-#       trae NYSE / NASDAQ / AMEX desde el screener FMP
-#       normaliza a DataFrame y filtra large caps
+# Flujo actualizado y unificado:
 #
-# 2. build_full_snapshot(kept_symbols) ->
-#       enriquece SOLO los tickers que tú marcaste en "kept"
-#       (watchlist enriquecida arriba en la app)
+# 1. build_universe()
+#    - arma universo de tickers grandes (NYSE / NASDAQ / AMEX) usando run_screener_for_exchange
+#    - normaliza columnas básicas (ticker, companyName, sector, industry, marketCap)
 #
-# 3. build_market_snapshot() ->
-#       arma la shortlist global del mercado (Tab1/Tab2):
-#       - baja métricas core por ticker (fundamentales)
-#       - mete placeholders de calidad/crecimiento
-#       - aplica filtro básico de apalancamiento
+# 2. fetch_fundamentals_for_symbol(ticker)
+#    - baja históricos de cashflow/balance/ingresos/acciones
+#    - calcula:
+#        * slope FCF/acción
+#        * recompras (% reducción acciones)
+#        * net_debt_to_ebitda_last
+#        * growths (revenue, OCF, FCF, deuda) último vs penúltimo
+#        * CAGR 5y-ish revenue y OCF
+#    - incluye placeholders altmanZScore, piotroskiScore, moat_flag
 #
-# 4. enrich_company_snapshot(snapshot_dict_de_un_ticker) ->
-#       agrega info cualitativa + series históricas
-#       para Tab2 (insiders, news, transcript, gráficos)
+# 3. build_fundamentals_block(symbols)
+#    - corre fetch_fundamentals_for_symbol para cada símbolo
+#
+# 4. enrich_universe_with_fundamentals(universe_df, fundamentals_df)
+#    - mergea universo + fundamentals_block
+#    - calcula is_quality_compounder (heurística)
+#
+# 5. build_market_snapshot()
+#    - une todo, devuelve list[dict] listo para st.session_state["snapshot_rows"]
+#
+# 6. build_full_snapshot(kept_symbols)
+#    - igual que build_market_snapshot pero sólo para la watchlist (kept)
+#
+# 7. enrich_company_snapshot(base_core)
+#    - arma la ficha detallada de 1 ticker (insiders / news sentiment / series históricas para los gráficos Tab2)
+#
+# 8. build_company_core_snapshot(ticker)
+#    - snapshot fundamental más "crudo" (por si quieres usarlo luego en otros módulos)
+#
+# Nota: este archivo ya no tiene funciones duplicadas.
+
 
 from typing import List, Dict, Any
 import math
-import json
 import numpy as np
 import pandas as pd
 
 from config import MAX_NET_DEBT_TO_EBITDA
 
 from fmp_api import (
+    # screener / universe
     run_screener_for_exchange,
-    # snapshots / estados financieros
+
+    # históricos anuales
+    get_cashflow_history,
+    get_balance_history,
+    get_income_history,
+    get_shares_history,
+
+    # estados financieros "core" y perfil (para uso avanzado / detalle)
     get_profile,
     get_income_statement,
     get_balance_sheet,
     get_cash_flow,
     get_ratios,
-    # históricos crudos por año
-    get_cashflow_history,
-    get_balance_history,
-    get_income_history,
-    get_shares_history,
-    # enriquecimiento cualitativo
+
+    # info cualitativa
     get_insider_trading,
     get_news,
     get_earnings_call_transcript,
@@ -49,231 +71,224 @@ from fmp_api import (
 from metrics import compute_core_financial_metrics
 
 
-# -------------------------------------------------
-# Utils internos
-# -------------------------------------------------
+# ============================================================
+# Helpers internos
+# ============================================================
 
-EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]
-
-def _safe_df(x) -> pd.DataFrame:
-    """
-    Convierte lo que entregue run_screener_for_exchange() en DataFrame.
-    Acepta:
-    - list[dict]
-    - DataFrame
-    """
-    if isinstance(x, pd.DataFrame):
-        return x.copy()
-    if isinstance(x, list):
-        return pd.DataFrame(x)
-    # último recurso: intenta DataFrame directo
-    return pd.DataFrame(x)
-
-
-def _row_large_cap(row: pd.Series, min_mktcap: float = 10_000_000_000) -> bool:
-    """
-    True si la fila es large cap >=10B USD.
-    """
-    mc = (
-        row.get("marketCap")
-        or row.get("mktCap")
-        or row.get("marketCapIntraday")
-    )
+def _safe_float(x):
     try:
-        return float(mc) >= float(min_mktcap)
+        return float(x)
+    except Exception:
+        return None
+
+
+def _large_cap_cut(mc_val: Any, threshold: float = 10_000_000_000) -> bool:
+    """
+    True si market cap >= threshold.
+    """
+    try:
+        return float(mc_val) >= float(threshold)
     except Exception:
         return False
 
 
-def _linear_trend(values: pd.Series) -> float | None:
+def _growth(curr_val, prev_val):
     """
-    Slope lineal simple (np.polyfit) para ver la tendencia.
-    Devuelve None si no hay suficientes puntos.
+    crecimiento relativo (curr-prev)/prev.
+    devuelve fracción, ej 0.12 = 12%
     """
-    s = pd.Series(values).dropna()
+    try:
+        if prev_val is None or prev_val == 0:
+            return None
+        return (curr_val - prev_val) / prev_val
+    except Exception:
+        return None
+
+
+def _cagr(first: float, last: float, n_years: float) -> float | None:
+    """
+    CAGR genérico. Devuelve fracción (0.18 = 18%).
+    Usa n_years ~ cantidad de pasos entre primer y último dato.
+    """
+    try:
+        if first is None or last is None:
+            return None
+        if first <= 0 or last <= 0:
+            return None
+        if n_years <= 0:
+            return None
+        return ((last / first) ** (1.0 / n_years)) - 1.0
+    except Exception:
+        return None
+
+
+def _linear_trend(vals: pd.Series) -> float | None:
+    """
+    slope lineal simple de una serie (y vs índice 0..n-1)
+    """
+    s = pd.Series(vals).dropna()
     if len(s) < 2:
         return None
     x = np.arange(len(s), dtype=float)
     y = s.astype(float).values
-    slope, _intercept = np.polyfit(x, y, 1)
+    slope, _ = np.polyfit(x, y, 1)
     return slope
 
 
-def _merge_scores_and_growth(base_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Placeholder seguro de calidad/crecimiento:
-    Agregamos llaves esperadas por la UI aunque todavía no
-    calculemos Altman Z, Piotroski, CAGR, etc.
-    """
-    enriched = []
-    for row in base_rows:
-        r = dict(row)
+# ============================================================
+# 1. Universo base (tickers grandes)
+# ============================================================
 
-        # Placeholders numéricos / métricas de screening
-        r.setdefault("altmanZScore", None)
-        r.setdefault("piotroskiScore", None)
-
-        r.setdefault("revenueGrowth", None)
-        r.setdefault("operatingCashFlowGrowth", None)
-        r.setdefault("freeCashFlowGrowth", None)
-        r.setdefault("debtGrowth", None)
-
-        r.setdefault("rev_CAGR_5y", None)
-        r.setdefault("rev_CAGR_3y", None)
-        r.setdefault("ocf_CAGR_5y", None)
-        r.setdefault("ocf_CAGR_3y", None)
-
-        # Campos sectoriales / moat (heurístico, placeholder)
-        r.setdefault("moat_flag", "—")
-
-        enriched.append(r)
-
-    return enriched
-
-
-def _quality_filter_final(d: Dict[str, Any]) -> bool:
-    """
-    Filtro mínimo para quedarse con candidatas 'sanas'.
-    Por ahora:
-    - Net Debt / EBITDA <= MAX_NET_DEBT_TO_EBITDA (si se conoce)
-    - (Large cap ya lo filtramos antes en build_universe)
-    """
-    nde = d.get("netDebt_to_EBITDA")
-    if nde is not None:
-        try:
-            if float(nde) > float(MAX_NET_DEBT_TO_EBITDA):
-                return False
-        except Exception:
-            pass
-    return True
-
-
-def _historicals_for_detail(symbol: str) -> Dict[str, Any]:
-    """
-    Baja históricos anuales y construye series para los gráficos de Tab2:
-    - fcf por acción
-    - shares en circulación
-    - deuda neta
-    """
-    cf   = get_cashflow_history(symbol)
-    bal  = get_balance_history(symbol)
-    inc  = get_income_history(symbol)
-    shr  = get_shares_history(symbol)
-
-    hist = (
-        _safe_df(cf)
-        .merge(_safe_df(shr), on="fiscalDate", how="left")
-        .merge(_safe_df(bal), on="fiscalDate", how="left")
-        .merge(_safe_df(inc), on="fiscalDate", how="left")
-        .sort_values("fiscalDate")
-        .reset_index(drop=True)
-    )
-
-    # calcula métricas derivadas por año
-    hist["fcf"] = hist.get("operatingCashFlow", 0) - hist.get("capitalExpenditure", 0)
-    hist["fcf_per_share"] = hist["fcf"] / hist.get("sharesDiluted", np.nan)
-    hist["net_debt"] = hist.get("totalDebt", 0) - hist.get("cashAndShortTermInvestments", 0)
-
-    years = []
-    fcfps_hist = []
-    shares_hist = []
-    net_debt_hist = []
-
-    for _, r in hist.iterrows():
-        # tratar de deducir "año fiscal" desde fiscalDate
-        fd = r.get("fiscalDate")
-        try:
-            year_str = str(fd)[:4]
-        except Exception:
-            year_str = "—"
-
-        years.append(year_str)
-        fcfps_hist.append(r.get("fcf_per_share", None))
-        shares_hist.append(r.get("sharesDiluted", None))
-        net_debt_hist.append(r.get("net_debt", None))
-
-    return {
-        "years": years,
-        "fcf_per_share_hist": fcfps_hist,
-        "shares_hist": shares_hist,
-        "net_debt_hist": net_debt_hist,
-    }
-
-
-# -------------------------------------------------
-# Paso 1. Universo inicial
-# -------------------------------------------------
+EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]
 
 def build_universe() -> pd.DataFrame:
     """
-    Trae screener para cada exchange, normaliza a DF,
-    concatena, deduplica por symbol y deja solo large caps.
+    Arma el universo de large caps combinando los exchanges soportados.
+    Normaliza columnas clave:
+        symbol / ticker
+        companyName
+        sector / industry
+        marketCap
+    y filtra marketCap >= 10B.
     """
-    frames: List[pd.DataFrame] = []
+    frames: list[pd.DataFrame] = []
 
     for exch in EXCHANGES:
-        chunk = run_screener_for_exchange(exch)
-        df_chunk = _safe_df(chunk)
+        ch = run_screener_for_exchange(exch)
 
-        # nos aseguramos de tener columnas clave aunque vengan ausentes
-        for col in ["symbol", "companyName", "sector", "industry", "marketCap"]:
-            if col not in df_chunk.columns:
-                df_chunk[col] = None
+        # el screener puede venir como list[dict] -> lo llevamos a DF
+        if isinstance(ch, list):
+            ch = pd.DataFrame(ch)
+        elif not isinstance(ch, pd.DataFrame):
+            ch = pd.DataFrame([])
 
-        frames.append(df_chunk)
+        frames.append(ch)
 
-    universe_raw = pd.concat(frames, ignore_index=True)
+    if frames:
+        universe = pd.concat(frames, ignore_index=True)
+    else:
+        universe = pd.DataFrame()
 
-    # limpiamos duplicados por ticker
-    universe_raw = (
-        universe_raw
-        .drop_duplicates(subset=["symbol"])
-        .reset_index(drop=True)
-    )
+    # normalización básica de nombre
+    if "companyName" not in universe.columns and "name" in universe.columns:
+        universe["companyName"] = universe["name"]
 
-    # quedarnos solo con large caps
-    mask_large = universe_raw.apply(_row_large_cap, axis=1)
-    universe_large = universe_raw[mask_large].reset_index(drop=True)
+    # normalización de ticker
+    if "symbol" not in universe.columns and "ticker" in universe.columns:
+        universe["symbol"] = universe["ticker"]
 
-    return universe_large
+    # marketCap estandarizado
+    # algunos screeners usan marketCap / mktCap / marketCapIntraday
+    def _pick_mktcap(row):
+        for k in ["marketCap", "mktCap", "marketCapIntraday"]:
+            if k in row and pd.notna(row[k]):
+                return row[k]
+        return None
+
+    universe["marketCap"] = universe.apply(_pick_mktcap, axis=1)
+
+    # filtrar solo large caps
+    universe = universe[universe["marketCap"].apply(_large_cap_cut)].reset_index(drop=True)
+
+    # aseguramos sector / industry
+    if "sector" not in universe.columns:
+        universe["sector"] = None
+    if "industry" not in universe.columns:
+        universe["industry"] = None
+
+    # creamos columna "ticker" que la UI espera
+    universe["ticker"] = universe["symbol"].astype(str)
+
+    return universe[[
+        "symbol",
+        "ticker",
+        "companyName",
+        "sector",
+        "industry",
+        "marketCap",
+    ]].reset_index(drop=True)
 
 
-# -------------------------------------------------
-# Paso 2. Bloque fundamentals rápido (slope FCF/acción, recompras, deuda)
-# -------------------------------------------------
+# ============================================================
+# 2. Métricas fundamentales por símbolo
+# ============================================================
 
 def fetch_fundamentals_for_symbol(symbol: str) -> dict:
     """
-    Calcula:
-    - slope de FCF por acción a ~5y
-    - recompras (% de reducción en sharesDiluted)
-    - cambio deuda neta
+    Baja históricos anuales (cashflow, balance, income, shares),
+    los fusiona por fiscalDate, y calcula:
+
+    - fcf_per_share_slope_5y
+    - buyback_pct_5y
+    - net_debt_change_5y
     - net_debt_to_ebitda_last
+    - revenueGrowth (último vs penúltimo)
+    - operatingCashFlowGrowth
+    - freeCashFlowGrowth
+    - debtGrowth
+    - rev_CAGR_5y  (aprox "5y": primero -> último del hist)
+    - ocf_CAGR_5y
+
+    Además mete placeholders:
+    - altmanZScore
+    - piotroskiScore
+    - moat_flag
     """
+
     cf   = get_cashflow_history(symbol)
     bal  = get_balance_history(symbol)
     inc  = get_income_history(symbol)
     shr  = get_shares_history(symbol)
 
+    # forzamos DataFrame por seguridad
+    def _to_df(x):
+        if isinstance(x, list):
+            return pd.DataFrame(x)
+        if isinstance(x, dict):
+            return pd.DataFrame([x])
+        if isinstance(x, pd.DataFrame):
+            return x
+        return pd.DataFrame()
+    cf  = _to_df(cf)
+    bal = _to_df(bal)
+    inc = _to_df(inc)
+    shr = _to_df(shr)
+
+    # merge anual por fiscalDate
     hist = (
-        _safe_df(cf)
-        .merge(_safe_df(shr), on="fiscalDate", how="left")
-        .merge(_safe_df(bal), on="fiscalDate", how="left")
-        .merge(_safe_df(inc), on="fiscalDate", how="left")
-        .sort_values("fiscalDate")
-        .reset_index(drop=True)
+        cf.merge(shr, on="fiscalDate", how="left")
+          .merge(bal, on="fiscalDate", how="left")
+          .merge(inc, on="fiscalDate", how="left")
+          .sort_values("fiscalDate")
+          .reset_index(drop=True)
     )
 
-    # derivadas anuales
-    hist["fcf"] = hist.get("operatingCashFlow", 0) - hist.get("capitalExpenditure", 0)
-    hist["fcf_per_share"] = hist["fcf"] / hist.get("sharesDiluted", np.nan)
-    hist["net_debt"] = hist.get("totalDebt", 0) - hist.get("cashAndShortTermInvestments", 0)
+    # derivadas
+    # FCF = OCF - CapEx
+    if "operatingCashFlow" not in hist.columns:
+        hist["operatingCashFlow"] = None
+    if "capitalExpenditure" not in hist.columns:
+        hist["capitalExpenditure"] = None
 
-    # slope de FCF/acción
+    hist["fcf"] = hist["operatingCashFlow"] - hist["capitalExpenditure"]
+
+    # FCF por acción
+    if "sharesDiluted" not in hist.columns:
+        hist["sharesDiluted"] = None
+    hist["fcf_per_share"] = hist["fcf"] / hist["sharesDiluted"]
+
+    # Deuda neta = totalDebt - cash
+    if "totalDebt" not in hist.columns:
+        hist["totalDebt"] = None
+    if "cashAndShortTermInvestments" not in hist.columns:
+        hist["cashAndShortTermInvestments"] = None
+    hist["net_debt"] = hist["totalDebt"] - hist["cashAndShortTermInvestments"]
+
+    # slope FCF/acción
     fcfps_slope = _linear_trend(hist["fcf_per_share"])
 
-    # recompras (% reducción acciones diluidas)
-    if len(hist) >= 2:
+    # recompras: % reducción en sharesDiluted (primera vs última fila)
+    if len(hist) > 0:
         shares_start = hist["sharesDiluted"].iloc[0]
         shares_end   = hist["sharesDiluted"].iloc[-1]
     else:
@@ -281,86 +296,164 @@ def fetch_fundamentals_for_symbol(symbol: str) -> dict:
         shares_end   = None
 
     if shares_start and shares_end:
-        buyback_pct_5y = (shares_start - shares_end) / shares_start
+        try:
+            buyback_pct_5y = (shares_start - shares_end) / shares_start
+        except Exception:
+            buyback_pct_5y = None
     else:
         buyback_pct_5y = None
 
-    # cambio deuda neta en el período
-    if "net_debt" in hist.columns and len(hist) >= 2:
-        net_debt_change_5y = hist["net_debt"].iloc[-1] - hist["net_debt"].iloc[0]
+    # cambio deuda neta en el periodo (último - primero)
+    if len(hist) >= 2:
+        try:
+            net_debt_change_5y = hist["net_debt"].iloc[-1] - hist["net_debt"].iloc[0]
+        except Exception:
+            net_debt_change_5y = None
     else:
         net_debt_change_5y = None
 
-    # net debt / EBITDA del último año
-    if len(hist) and ("ebitda" in hist.columns):
-        last = hist.iloc[-1]
-        if (
-            last.get("ebitda") not in [None, 0]
-            and last.get("net_debt") is not None
-        ):
-            net_debt_to_ebitda_last = last["net_debt"] / last["ebitda"]
-        else:
-            net_debt_to_ebitda_last = None
+    # net_debt / EBITDA (último año)
+    if len(hist) > 0:
+        last_row = hist.iloc[-1]
+    else:
+        last_row = {}
+    eb = last_row.get("ebitda", last_row.get("EBITDA", None))
+    nd = last_row.get("net_debt", None)
+    if eb not in [None, 0] and nd is not None:
+        net_debt_to_ebitda_last = nd / eb
     else:
         net_debt_to_ebitda_last = None
 
+    # growths (último vs penúltimo)
+    if len(hist) >= 2:
+        prev_row = hist.iloc[-2]
+        revenueGrowth = _growth(last_row.get("revenue"), prev_row.get("revenue"))
+        operatingCashFlowGrowth = _growth(
+            last_row.get("operatingCashFlow"),
+            prev_row.get("operatingCashFlow"),
+        )
+        freeCashFlowGrowth = _growth(
+            last_row.get("fcf"),
+            prev_row.get("fcf"),
+        )
+        debtGrowth = _growth(
+            last_row.get("net_debt"),
+            prev_row.get("net_debt"),
+        )
+    else:
+        revenueGrowth = None
+        operatingCashFlowGrowth = None
+        freeCashFlowGrowth = None
+        debtGrowth = None
+
+    # CAGR "5y": en realidad primer vs último
+    n_periods = max(len(hist) - 1, 1)
+    if len(hist) > 0:
+        first_row = hist.iloc[0]
+    else:
+        first_row = {}
+
+    rev_CAGR_5y = _cagr(
+        first_row.get("revenue"), last_row.get("revenue"), n_periods
+    )
+    ocf_CAGR_5y = _cagr(
+        first_row.get("operatingCashFlow"),
+        last_row.get("operatingCashFlow"),
+        n_periods,
+    )
+
+    # placeholders por ahora
+    altmanZScore = None
+    piotroskiScore = None
+    moat_flag = None
+
     return {
         "symbol": symbol,
+
+        # métricas cuantitativas que usa tu tabla
         "fcf_per_share_slope_5y": fcfps_slope,
         "buyback_pct_5y": buyback_pct_5y,
         "net_debt_change_5y": net_debt_change_5y,
         "net_debt_to_ebitda_last": net_debt_to_ebitda_last,
+
+        "revenueGrowth": revenueGrowth,
+        "operatingCashFlowGrowth": operatingCashFlowGrowth,
+        "freeCashFlowGrowth": freeCashFlowGrowth,
+        "debtGrowth": debtGrowth,
+
+        "rev_CAGR_5y": rev_CAGR_5y,
+        "ocf_CAGR_5y": ocf_CAGR_5y,
+
+        # placeholders cualitativos / analíticos
+        "altmanZScore": altmanZScore,
+        "piotroskiScore": piotroskiScore,
+        "moat_flag": moat_flag,
     }
 
 
-def build_fundamentals_block(symbols: List[str]) -> pd.DataFrame:
+def build_fundamentals_block(symbols: list[str]) -> pd.DataFrame:
     """
-    Itera cada símbolo y arma las métricas de FCF, recompras, deuda.
-    Nunca revienta: si falla un ticker, rellena None.
+    Llama fetch_fundamentals_for_symbol para cada símbolo
+    y devuelve un DataFrame con una fila por ticker.
     """
-    rows = []
+    rows: list[dict] = []
     for sym in symbols:
         try:
-            row = fetch_fundamentals_for_symbol(sym)
+            rows.append(fetch_fundamentals_for_symbol(sym))
         except Exception:
-            row = {
+            # fallback seguro si falla un ticker
+            rows.append({
                 "symbol": sym,
                 "fcf_per_share_slope_5y": None,
                 "buyback_pct_5y": None,
                 "net_debt_change_5y": None,
                 "net_debt_to_ebitda_last": None,
-            }
-        rows.append(row)
-
+                "revenueGrowth": None,
+                "operatingCashFlowGrowth": None,
+                "freeCashFlowGrowth": None,
+                "debtGrowth": None,
+                "rev_CAGR_5y": None,
+                "ocf_CAGR_5y": None,
+                "altmanZScore": None,
+                "piotroskiScore": None,
+                "moat_flag": None,
+            })
     return pd.DataFrame(rows)
 
+
+# ============================================================
+# 3. Merge universo + fundamentals + flags
+# ============================================================
 
 def enrich_universe_with_fundamentals(
     universe_df: pd.DataFrame,
     fundamentals_df: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Hace merge 1:1 por symbol y genera banderas de calidad.
+    Hace el merge 1:1 por symbol y calcula is_quality_compounder
+    a partir de:
+      - fcf_per_share_slope_5y > 0
+      - buyback_pct_5y > 5%
+      - net_debt_to_ebitda_last < 2
     """
+
     full = universe_df.merge(
         fundamentals_df,
-        on="symbol",
         how="left",
+        on="symbol",
         validate="1:1"
     )
 
-    def _flag_positive(x):
-        return (x is not None) and (pd.notna(x)) and (x > 0)
+    # helper chico para booleanos:
+    def _flag_positive(val):
+        return (val is not None) and (pd.notna(val)) and (val > 0)
 
-    # fcf en alza
     full["flag_fcf_up"] = full["fcf_per_share_slope_5y"].apply(_flag_positive)
 
-    # recompras agresivas (>5%)
     full["flag_buybacks"] = full["buyback_pct_5y"].apply(
         lambda x: (x is not None) and pd.notna(x) and (x > 0.05)
     )
 
-    # deuda controlada (<2x EBITDA aprox)
     full["flag_net_debt_ok"] = full["net_debt_to_ebitda_last"].apply(
         lambda x: (x is not None) and pd.notna(x) and (x < 2)
     )
@@ -374,41 +467,84 @@ def enrich_universe_with_fundamentals(
     return full
 
 
-# -------------------------------------------------
-# Paso 3. build_full_snapshot() -> Watchlist enriquecida
-# -------------------------------------------------
+# ============================================================
+# 4. build_market_snapshot() → botón "Run Screening"
+# ============================================================
 
-def build_full_snapshot(kept_symbols: List[str]) -> pd.DataFrame:
+def build_market_snapshot() -> list[dict]:
     """
-    Para la watchlist personalizada que tienes en st.session_state["kept"].
-    - Filtra el universo a SOLO esos tickers.
-    - Calcula fundamentals_block solo para esos tickers.
-    - Devuelve DF mergeado con flags como is_quality_compounder.
+    Crea la shortlist global:
+    - universo large caps
+    - fundamentals para todos
+    - merge
+    Devuelve list[dict] (cada dict es una fila), que va directo
+    a st.session_state["snapshot_rows"].
     """
+    universe = build_universe()
+
+    syms = (
+        universe["symbol"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    fundamentals_df = build_fundamentals_block(syms)
+    merged = enrich_universe_with_fundamentals(universe, fundamentals_df)
+
+    # aseguramos "ticker"
+    if "ticker" not in merged.columns and "symbol" in merged.columns:
+        merged["ticker"] = merged["symbol"]
+
+    return merged.to_dict(orient="records")
+
+
+# ============================================================
+# 5. build_full_snapshot(kept_symbols) → watchlist arriba
+# ============================================================
+
+def build_full_snapshot(kept_symbols: list[str]) -> pd.DataFrame:
+    """
+    Igual a build_market_snapshot pero limitado
+    a la watchlist del usuario (kept_symbols).
+
+    Devuelve un DataFrame ya mergeado y con flags
+    (para que la app pueda hacer subset de columnas
+    como net_debt_to_ebitda_last, buyback_pct_5y, etc.)
+    """
+
     if not kept_symbols:
         return pd.DataFrame()
 
-    universe_all = build_universe()
-    uni_subset = universe_all[universe_all["symbol"].isin(kept_symbols)].copy()
+    universe = build_universe()
+    sub_uni = universe[universe["symbol"].isin(kept_symbols)].reset_index(drop=True)
 
-    fundamentals_block = build_fundamentals_block(kept_symbols)
+    if sub_uni.empty:
+        return pd.DataFrame()
 
-    final_df = enrich_universe_with_fundamentals(
-        uni_subset,
-        fundamentals_block
+    fundamentals_df = build_fundamentals_block(
+        sub_uni["symbol"].dropna().astype(str).unique().tolist()
     )
 
-    return final_df
+    merged = enrich_universe_with_fundamentals(sub_uni, fundamentals_df)
+
+    # por si en la UI esperan "ticker"
+    if "ticker" not in merged.columns and "symbol" in merged.columns:
+        merged["ticker"] = merged["symbol"]
+
+    return merged.reset_index(drop=True)
 
 
-# -------------------------------------------------
-# Paso 4. build_market_snapshot() -> Shortlist global Tab1/Tab2
-# -------------------------------------------------
+# ============================================================
+# 6. build_company_core_snapshot() → métricas "crudas" 1 ticker
+# ============================================================
 
 def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
     """
-    Métricas fundamentales core de UN TICKER usando estados financieros,
-    ratios, etc. Llama a compute_core_financial_metrics().
+    Snapshot más detallado de un ticker único usando
+    estados financieros y ratios. Útil como base para análisis
+    más profundo o para debug.
     """
     profile = get_profile(ticker)
     income_hist = get_income_statement(ticker)
@@ -416,13 +552,12 @@ def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
     cash_hist = get_cash_flow(ticker)
     ratios_hist = get_ratios(ticker)
 
-    # validación mínima para no romper
-    if (
-        not isinstance(income_hist, list) or len(income_hist) < 2 or
-        not isinstance(balance_hist, list) or len(balance_hist) < 2 or
-        not isinstance(cash_hist, list) or len(cash_hist) < 2
-    ):
-        raise ValueError("historial financiero insuficiente")
+    # validación mínima para no reventar
+    def _ok_list(x):
+        return isinstance(x, list) and len(x) >= 2
+
+    if not (_ok_list(income_hist) and _ok_list(balance_hist) and _ok_list(cash_hist)):
+        raise ValueError("historial financiero insuficiente para core snapshot")
 
     base_metrics = compute_core_financial_metrics(
         ticker=ticker,
@@ -433,225 +568,129 @@ def build_company_core_snapshot(ticker: str) -> Dict[str, Any]:
         cash_hist=cash_hist,
     )
 
-    # compute_core_financial_metrics deberá darnos como mínimo:
-    # {
-    #   "ticker": ...,
-    #   "name": ...,
-    #   "sector": ...,
-    #   "industry": ...,
-    #   "marketCap": ...,
-    #   "netDebt_to_EBITDA": ...,
-    #   ...
-    # }
     return base_metrics
 
 
-def build_market_snapshot(limit: int = 40) -> list[dict]:
+# ============================================================
+# 7. enrich_company_snapshot() → Tab2 ficha detallada
+# ============================================================
+
+def enrich_company_snapshot(base_core: dict) -> dict:
     """
-    Devuelve las filas que Tab1 / Tab2 usan (rows_data).
-    Ahora sí incluye fundamentals (fcf por acción, buybacks, deuda, etc.).
+    Completa la ficha del Tab2:
+    - insider_signal (insider trading neto)
+    - sentiment_flag / sentiment_reason (noticias recientes)
+    - transcript_summary (earnings call)
+    - series históricas para gráficos:
+        years, fcf_per_share_hist, shares_hist, net_debt_hist
     """
 
-    uni = build_universe()
-
-    tickers = (
-        uni["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-    # puedes subir o eliminar este límite
-    tickers = tickers[:limit]
-
-    rows_raw: list[dict] = []
-
-    for tkr in tickers:
-        # 1. core fundamental snapshot (income/balance/cash/ratios)
-        try:
-            core = build_company_core_snapshot(tkr)
-        except Exception:
-            # si no puedo ni armar lo básico, skip
-            continue
-
-        # 2. bloque "fundamentals" anualizado (tendencias 3-5y)
-        try:
-            fblock = fetch_fundamentals_for_symbol(tkr)
-        except Exception:
-            fblock = {
-                "symbol": tkr,
-                "fcf_per_share_slope_5y": None,
-                "buyback_pct_5y": None,
-                "net_debt_change_5y": None,
-                "net_debt_to_ebitda_last": None,
-            }
-
-        # merge de ambos dicts
-        merged = dict(core)
-        merged.update(fblock)
-
-        # ticker / symbol consistentes
-        if "ticker" not in merged and "symbol" in merged:
-            merged["ticker"] = merged["symbol"]
-        if "symbol" not in merged and "ticker" in merged:
-            merged["symbol"] = merged["ticker"]
-
-        # Quality flags como en enrich_universe_with_fundamentals()
-        def _pos(x):
-            return (x is not None) and (not (isinstance(x, float) and math.isnan(x))) and (x > 0)
-
-        merged["flag_fcf_up"] = _pos(merged.get("fcf_per_share_slope_5y"))
-        merged["flag_buybacks"] = (
-            (merged.get("buyback_pct_5y") is not None)
-            and (not (isinstance(merged.get("buyback_pct_5y"), float) and math.isnan(merged.get("buyback_pct_5y"))))
-            and (merged.get("buyback_pct_5y") > 0.05)
-        )
-
-        nde_last = merged.get("net_debt_to_ebitda_last")
-        merged["flag_net_debt_ok"] = (
-            (nde_last is not None)
-            and (not (isinstance(nde_last, float) and math.isnan(nde_last)))
-            and (nde_last < 2)
-        )
-
-        merged["is_quality_compounder"] = (
-            merged["flag_fcf_up"]
-            and merged["flag_buybacks"]
-            and merged["flag_net_debt_ok"]
-        )
-
-        rows_raw.append(merged)
-
-    # 3. placeholders que todavía no llenamos con API reales (Altman Z, Piotroski, etc.)
-    rows_enriched = _merge_scores_and_growth(rows_raw)
-
-    # 4. filtro apalancamiento global (usa MAX_NET_DEBT_TO_EBITDA)
-    final_rows = [r for r in rows_enriched if _quality_filter_final(r)]
-
-    return final_rows
-
-
-# -------------------------------------------------
-# Paso 5. enrich_company_snapshot() -> Detalle 1 ticker (Tab2)
-# -------------------------------------------------
-
-def enrich_company_snapshot(base_core_snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Parte de lo que ya tenemos en Tab1 para un ticker y
-    le agrega:
-    - insiders (señal muy burda)
-    - sentimiento noticias
-    - resumen de última transcript
-    - series históricas para los charts
-    """
-    out = dict(base_core_snapshot)
-    ticker = out.get("ticker") or out.get("symbol")
-
+    ticker = base_core.get("ticker") or base_core.get("symbol")
     if ticker is None:
-        return out  # sin ticker no podemos enriquecer más
+        # sin ticker, devolvemos lo que haya
+        return base_core
 
-    # ---------- insiders ----------
-    try:
-        insider_raw = get_insider_trading(ticker)
-    except Exception:
-        insider_raw = []
+    # --- histórico financiero otra vez para sacar las curvas ---
+    cf   = get_cashflow_history(ticker)
+    bal  = get_balance_history(ticker)
+    inc  = get_income_history(ticker)
+    shr  = get_shares_history(ticker)
 
-    insider_signal = "neutral"
-    if isinstance(insider_raw, list) and len(insider_raw) > 0:
-        # Heurística MUY básica:
-        # si hay más compras que ventas recientes -> "bullish"
-        buys = 0.0
-        sells = 0.0
-        for tr in insider_raw:
-            # intentamos leer tipo y cantidad
-            typ = str(tr.get("transactionType", "")).lower()
-            val = tr.get("amount", 0) or tr.get("shares", 0)
-            try:
-                val = float(val)
-            except Exception:
-                val = 0.0
-            if "buy" in typ:
-                buys += val
-            if "sell" in typ:
-                sells += val
-        if buys > sells * 1.2:
-            insider_signal = "bullish"
-        elif sells > buys * 1.2:
-            insider_signal = "bearish"
+    def _to_df(x):
+        if isinstance(x, list):
+            return pd.DataFrame(x)
+        if isinstance(x, dict):
+            return pd.DataFrame([x])
+        if isinstance(x, pd.DataFrame):
+            return x
+        return pd.DataFrame()
 
-    out["insider_signal"] = insider_signal
+    cf  = _to_df(cf)
+    bal = _to_df(bal)
+    inc = _to_df(inc)
+    shr = _to_df(shr)
 
-    # ---------- news / sentimiento ----------
-    try:
-        news_raw = get_news(ticker)
-    except Exception:
-        news_raw = []
-
-    sentiment_flag = "neutral"
-    sentiment_reason = "tono mixto/sectorial"
-    if isinstance(news_raw, list) and len(news_raw) > 0:
-        # micro heurística: si en títulos sale 'record', 'beat', etc => bullish
-        heads = " ".join([str(n.get("title", "")).lower() for n in news_raw[:5]])
-        if any(w in heads for w in ["record", "beat", "surge", "strong"]):
-            sentiment_flag = "bullish"
-            sentiment_reason = "titulares positivos recientes"
-        elif any(w in heads for w in ["probe", "fraud", "miss", "lawsuit", "sec "]):
-            sentiment_flag = "bearish"
-            sentiment_reason = "titulares de riesgo/regulatorio"
-
-    out["sentiment_flag"] = sentiment_flag
-    out["sentiment_reason"] = sentiment_reason
-
-    # ---------- earnings call transcript ----------
-    try:
-        transcript_raw = get_earnings_call_transcript(ticker)
-    except Exception:
-        transcript_raw = None
-
-    transcript_summary = "Sin señales fuertes en la última call."
-    if transcript_raw:
-        # tratamos de construir un mini resumen muy defensivo
-        if isinstance(transcript_raw, dict):
-            body = transcript_raw.get("content") or transcript_raw.get("text") or ""
-        elif isinstance(transcript_raw, list) and len(transcript_raw) > 0:
-            body = transcript_raw[0].get("content", "") or transcript_raw[0].get("text","")
-        else:
-            body = ""
-
-        if body:
-            # tomamos las ~300 primeras chars, pero limpiando saltos
-            snippet = " ".join(str(body).split())[:300]
-            transcript_summary = (
-                "Extracto call: "
-                + snippet
-                + ("..." if len(snippet) == 300 else "")
-            )
-
-    out["transcript_summary"] = transcript_summary
-
-    # ---------- series históricas para gráficos ----------
-    hist_block = _historicals_for_detail(ticker)
-    out.update(hist_block)
-
-    # normalizamos nombres para que Tab2 no reviente
-    if "symbol" not in out and "ticker" in out:
-        out["symbol"] = out["ticker"]
-    if "ticker" not in out and "symbol" in out:
-        out["ticker"] = out["symbol"]
-
-    # aseguramos que haya sector/industry aunque el DF base no las traiga
-    out.setdefault("sector", base_core_snapshot.get("sector", "—"))
-    out.setdefault("industry", base_core_snapshot.get("industry", "—"))
-    out.setdefault("moat_flag", base_core_snapshot.get("moat_flag", "—"))
-
-    # business summary / why it matters / risk note:
-    # si compute_core_financial_metrics no lo trae, dejamos textos placeholder
-    out.setdefault("business_summary", base_core_snapshot.get("business_summary", "—"))
-    out.setdefault("why_it_matters", base_core_snapshot.get("why_it_matters", "—"))
-    out.setdefault(
-        "core_risk_note",
-        base_core_snapshot.get("core_risk_note", "riesgo principal no crítico visible"),
+    hist = (
+        cf.merge(shr, on="fiscalDate", how="left")
+          .merge(bal, on="fiscalDate", how="left")
+          .merge(inc, on="fiscalDate", how="left")
+          .sort_values("fiscalDate")
+          .reset_index(drop=True)
     )
 
-    return out
+    # derivadas para las series
+    if "operatingCashFlow" not in hist.columns:
+        hist["operatingCashFlow"] = None
+    if "capitalExpenditure" not in hist.columns:
+        hist["capitalExpenditure"] = None
+    hist["fcf"] = hist["operatingCashFlow"] - hist["capitalExpenditure"]
+
+    if "sharesDiluted" not in hist.columns:
+        hist["sharesDiluted"] = None
+    hist["fcf_per_share"] = hist["fcf"] / hist["sharesDiluted"]
+
+    if "totalDebt" not in hist.columns:
+        hist["totalDebt"] = None
+    if "cashAndShortTermInvestments" not in hist.columns:
+        hist["cashAndShortTermInvestments"] = None
+    hist["net_debt"] = hist["totalDebt"] - hist["cashAndShortTermInvestments"]
+
+    years_list = hist["fiscalDate"].astype(str).tolist() if "fiscalDate" in hist.columns else []
+    fcfps_list = hist["fcf_per_share"].tolist() if "fcf_per_share" in hist.columns else []
+    shares_list = hist["sharesDiluted"].tolist() if "sharesDiluted" in hist.columns else []
+    netdebt_list = hist["net_debt"].tolist() if "net_debt" in hist.columns else []
+
+    # --- insider trading (muy heurístico) ---
+    insider_raw = get_insider_trading(ticker)
+    insider_signal = "neutral"
+    try:
+        # Ejemplo: si compras > ventas => "bullish"
+        df_ins = _to_df(insider_raw)
+        if not df_ins.empty and "transactionType" in df_ins.columns:
+            buys = (df_ins["transactionType"] == "Buy").sum()
+            sells = (df_ins["transactionType"] == "Sell").sum()
+            if buys > sells:
+                insider_signal = "bullish"
+            elif sells > buys:
+                insider_signal = "bearish"
+    except Exception:
+        pass
+
+    # --- news sentiment (placeholder muy simple) ---
+    news_raw = get_news(ticker)
+    sentiment_flag = "neutral"
+    sentiment_reason = "tono mixto"
+    try:
+        df_news = _to_df(news_raw)
+        # podríamos hacer un conteo naive de palabras, pero sin NLP real dejamos neutral.
+        if not df_news.empty:
+            sentiment_reason = "últimas noticias revisadas"
+    except Exception:
+        pass
+
+    # --- earnings call transcript summary (placeholder) ---
+    transcript_summary = "Sin señales fuertes en la última call."
+    try:
+        call_txt = get_earnings_call_transcript(ticker)
+        # acá podrías resumir con heurística (ej: primeras líneas)
+        if isinstance(call_txt, str) and len(call_txt) > 0:
+            transcript_summary = "Transcripción disponible (resumen manual pendiente)."
+    except Exception:
+        pass
+
+    # armamos el dict enriquecido
+    enriched = dict(base_core)  # copia superficial
+    enriched.update({
+        "insider_signal": insider_signal,
+        "sentiment_flag": sentiment_flag,
+        "sentiment_reason": sentiment_reason,
+        "transcript_summary": transcript_summary,
+
+        # series históricas para los gráficos del Tab2
+        "years": years_list,
+        "fcf_per_share_hist": fcfps_list,
+        "shares_hist": shares_list,
+        "net_debt_hist": netdebt_list,
+    })
+
+    return enriched
