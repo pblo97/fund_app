@@ -19,12 +19,6 @@ from fmp_api import (
 )
 
 from metrics import compute_core_metrics
-from text_analysis import (
-    summarize_business,
-    summarize_news_sentiment,
-    summarize_insiders,
-    summarize_transcript,
-)
 
 EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]
 
@@ -41,59 +35,77 @@ def _is_large_cap_row(row: Dict[str, Any], min_mktcap: float = 10_000_000_000) -
         return False
 
 
+def _normalize_chunk_to_df(chunk) -> pd.DataFrame:
+    """
+    Asegura que run_screener_for_exchange(...) termine siendo DataFrame.
+    Soporta:
+      - list[dict]
+      - dict con key "data"
+      - DataFrame
+    """
+    if chunk is None:
+        return pd.DataFrame()
+
+    if isinstance(chunk, pd.DataFrame):
+        return chunk.copy()
+
+    if isinstance(chunk, list):
+        return pd.DataFrame(chunk)
+
+    if isinstance(chunk, dict):
+        # caso tipo {"data":[...]}
+        if "data" in chunk and isinstance(chunk["data"], list):
+            return pd.DataFrame(chunk["data"])
+        # caso dict plano con info de 1 ticker
+        return pd.DataFrame([chunk])
+
+    # fallback
+    return pd.DataFrame()
+
+
 def build_universe() -> pd.DataFrame:
+    """
+    Une los screeners de cada exchange, normaliza columnas,
+    filtra solo large caps y devuelve symbol, companyName, sector, industry, marketCap.
+    """
     frames: List[pd.DataFrame] = []
 
     for exch in EXCHANGES:
         try:
-            chunk = run_screener_for_exchange(exch)
+            raw = run_screener_for_exchange(exch)
         except Exception:
-            continue
+            raw = None
 
-        if chunk is None:
+        df_chunk = _normalize_chunk_to_df(raw)
+        if df_chunk.empty:
             continue
-
-        # normalizar a DataFrame
-        if isinstance(chunk, list):
-            df_chunk = pd.DataFrame(chunk)
-        elif isinstance(chunk, dict):
-            if "data" in chunk and isinstance(chunk["data"], list):
-                df_chunk = pd.DataFrame(chunk["data"])
-            else:
-                df_chunk = pd.DataFrame([chunk])
-        elif isinstance(chunk, pd.DataFrame):
-            df_chunk = chunk
-        else:
-            continue
-
         if "symbol" not in df_chunk.columns:
             continue
 
         frames.append(df_chunk)
 
     if not frames:
-        return pd.DataFrame(columns=["symbol","companyName","sector","industry","marketCap"])
+        return pd.DataFrame(columns=["symbol", "companyName", "sector", "industry", "marketCap"])
 
     uni = pd.concat(frames, ignore_index=True)
 
     # renombrar name -> companyName si es necesario
     if "companyName" not in uni.columns and "name" in uni.columns:
-        uni = uni.rename(columns={"name":"companyName"})
+        uni = uni.rename(columns={"name": "companyName"})
 
     # asegurar marketCap
     if "marketCap" not in uni.columns:
-        for fallback in ["mktCap", "marketCapIntraday"]:
-            if fallback in uni.columns:
-                uni["marketCap"] = uni[fallback]
+        for fb in ["mktCap", "marketCapIntraday"]:
+            if fb in uni.columns:
+                uni["marketCap"] = uni[fb]
                 break
         if "marketCap" not in uni.columns:
             uni["marketCap"] = None
 
     # limpiar duplicados
     uni = (
-        uni
-        .drop_duplicates(subset=["symbol"])
-        .reset_index(drop=True)
+        uni.drop_duplicates(subset=["symbol"])
+           .reset_index(drop=True)
     )
 
     # filtrar large cap
@@ -101,19 +113,19 @@ def build_universe() -> pd.DataFrame:
     uni = uni[mask_large].reset_index(drop=True)
 
     # columnas mínimas
-    for col in ["symbol","companyName","sector","industry","marketCap"]:
+    for col in ["symbol", "companyName", "sector", "industry", "marketCap"]:
         if col not in uni.columns:
             uni[col] = None
 
-    return uni[["symbol","companyName","sector","industry","marketCap"]].copy()
+    return uni[["symbol", "companyName", "sector", "industry", "marketCap"]].copy()
 
 
 def build_company_row(symbol: str) -> Dict[str, Any] | None:
     """
-    Baja toda la data cruda de FMP para un ticker,
-    llama compute_core_metrics,
-    y devuelve una fila lista para la tabla principal (Tab1),
-    más info base que Tab2 usará.
+    Para un ticker:
+    - Descarga los estados financieros crudos (histórico anual).
+    - Llama compute_core_metrics(...) para consolidar todo.
+    - Devuelve un dict con todas las llaves que app.py y dataframe_from_rows() esperan.
     """
     try:
         profile      = get_profile(symbol) or {}
@@ -125,7 +137,7 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
     except Exception:
         return None
 
-    # sanity mínimo para no reventar
+    # sanity mínimo: necesitamos al menos 2 años para calcular growth
     if len(income_hist) < 2 or len(cash_hist) < 2 or len(balance_hist) < 2:
         return None
 
@@ -139,8 +151,8 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
         shares_hist=shares_hist,
     )
 
-    # fila final coherente con app.py/dataframe_from_rows
-    row: Dict[str, Any] = {
+    # fila final coherente con app.py/dataframe_from_rows()
+    return {
         "ticker": core["ticker"],
         "name": core["name"] or core["ticker"],
         "companyName": core["name"] or core["ticker"],
@@ -168,19 +180,19 @@ def build_company_row(symbol: str) -> Dict[str, Any] | None:
         "moat_flag": core["moat_flag"],
         "business_summary": core["business_summary"],
 
-        # series para el Tab2
+        # series históricas para Tab2
         "years": core["years"],
         "fcf_per_share_hist": core["fcf_per_share_hist"],
         "shares_hist": core["shares_hist"],
         "net_debt_hist": core["net_debt_hist"],
     }
 
-    return row
-
 
 def build_market_snapshot() -> List[Dict[str, Any]]:
     """
-    Arma la shortlist para Tab1.
+    1. arma universo large cap
+    2. recorre cada symbol
+    3. junta las filas válidas
     """
     uni = build_universe()
     out: List[Dict[str, Any]] = []
@@ -194,16 +206,8 @@ def build_market_snapshot() -> List[Dict[str, Any]]:
         if snap is None:
             continue
 
-        # filtro suave de leverage (no las boto si están pasadas,
-        # porque tú igual las filtras con el slider en la UI, pero
-        # si quisieras cortarlas acá puedes hacerlo)
-        nde = snap.get("netDebt_to_EBITDA")
-        try:
-            if nde is not None and float(nde) > float(MAX_NET_DEBT_TO_EBITDA):
-                pass  # actualmente dejamos pasar igual
-        except Exception:
-            pass
-
+        # (opcional) podríamos filtrar por apalancamiento aquí con MAX_NET_DEBT_TO_EBITDA,
+        # pero no es obligatorio porque la UI igual aplica el slider leverage_ok.
         out.append(snap)
 
     return out
@@ -211,44 +215,65 @@ def build_market_snapshot() -> List[Dict[str, Any]]:
 
 def enrich_company_snapshot(base_row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Tab2: agrega insiders, news sentiment y earnings call.
+    Enriquecimiento cualitativo para Tab2.
+    Este paso usa insiders, noticias y earnings call,
+    y hace resúmenes de texto.
+
+    Hacemos import local de text_analysis para no romper el import global.
+    Si text_analysis falla, devolvemos defaults y seguimos.
     """
     symbol = base_row.get("ticker") or base_row.get("symbol")
     if not symbol:
         return base_row
+
+    # intentamos importar análisis de texto acá adentro
+    try:
+        from text_analysis import (
+            summarize_business,
+            summarize_news_sentiment,
+            summarize_insiders,
+            summarize_transcript,
+        )
+    except Exception:
+        summarize_business = lambda prof_or_desc: base_row.get("business_summary", "")
+        summarize_news_sentiment = lambda news: ("neutral", "tono mixto/sectorial")
+        summarize_insiders = lambda insider: ("neutral", "")
+        summarize_transcript = lambda txt: "Sin señales fuertes en la última call."
 
     # insiders
     try:
         insider_raw = get_insider_trading(symbol)
     except Exception:
         insider_raw = []
-    ins_sig, ins_note = summarize_insiders(insider_raw)
+    insider_signal, insider_note = summarize_insiders(insider_raw)
 
-    # news sentiment
+    # news / sentimiento
     try:
         news_raw = get_news(symbol)
     except Exception:
         news_raw = []
-    sent_flag, sent_reason = summarize_news_sentiment(news_raw)
+    sentiment_flag, sentiment_reason = summarize_news_sentiment(news_raw)
 
-    # transcript
+    # earnings call transcript
     try:
         transcript_txt = get_earnings_call_transcript(symbol)
     except Exception:
         transcript_txt = ""
-    call_sum = summarize_transcript(transcript_txt)
+    transcript_summary = summarize_transcript(transcript_txt)
 
     enriched = dict(base_row)
-    enriched["insider_signal"] = ins_sig or "neutral"
-    enriched["insider_note"] = ins_note or ""
-    enriched["sentiment_flag"] = sent_flag or "neutral"
-    enriched["sentiment_reason"] = sent_reason or "tono mixto/sectorial"
+    enriched["insider_signal"] = insider_signal or "neutral"
+    enriched["insider_note"] = insider_note or ""
+    enriched["sentiment_flag"] = sentiment_flag or "neutral"
+    enriched["sentiment_reason"] = sentiment_reason or "tono mixto/sectorial"
     enriched["transcript_summary"] = (
-        call_sum or "Sin señales fuertes en la última call."
+        transcript_summary or "Sin señales fuertes en la última call."
     )
 
-    # por si en algún caso base_row no traía un resumen legible
+    # Si no teníamos resumen de negocio legible, lo intentamos generar
     if not enriched.get("business_summary"):
-        enriched["business_summary"] = summarize_business({"description": base_row.get("business_summary", "")})
+        enriched["business_summary"] = summarize_business(
+            {"description": base_row.get("business_summary", "")}
+        )
 
     return enriched
