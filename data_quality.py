@@ -6,21 +6,43 @@ from utils import safe_float
 
 def get_quality_signals_bulk(symbols: List[str]) -> pd.DataFrame:
     raw = get_financial_scores_bulk(symbols)
+
     rows = []
     for sym, dat in raw.items():
+        altman = safe_float(dat.get("altmanZScore"))
+        piot = safe_float(dat.get("piotroskiScore"))
         rows.append({
             "ticker": sym,
-            "altmanZScore": safe_float(dat.get("altmanZScore")),
-            "piotroskiScore": safe_float(dat.get("piotroskiScore")),
+            "altmanZScore": altman,
+            "piotroskiScore": piot,
         })
-    df = pd.DataFrame(rows).dropna(subset=["altmanZScore", "piotroskiScore"])
-    return df
+
+    # si no llegó nada, devolvemos DF vacío pero con las columnas correctas
+    if not rows:
+        return pd.DataFrame(
+            columns=["ticker", "altmanZScore", "piotroskiScore"]
+        )
+
+    df = pd.DataFrame(rows)
+
+    # si por alguna razón faltan columnas, créalas
+    for col in ["altmanZScore", "piotroskiScore"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # ahora sí: filtrar NaN en estas dos métricas
+    df = df.dropna(subset=["altmanZScore", "piotroskiScore"])
+    return df.reset_index(drop=True)
 
 def passes_quality_hard(row: pd.Series) -> bool:
-    if row["altmanZScore"] is None or row["piotroskiScore"] is None:
+    # protegemos accesos con get
+    altman = row.get("altmanZScore")
+    piot = row.get("piotroskiScore")
+
+    if altman is None or piot is None:
         return False
-    if row["altmanZScore"] < ALTMAN_MIN:
+    if altman < ALTMAN_MIN:
         return False
-    if row["piotroskiScore"] < PIOTROSKI_MIN:
+    if piot < PIOTROSKI_MIN:
         return False
     return True
