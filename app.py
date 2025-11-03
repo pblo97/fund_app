@@ -26,21 +26,37 @@ with tab1:
 with tab2:
     st.subheader("Ficha fundamental completa")
 
-    tickers_available = df_list["ticker"].tolist()
-    if not tickers_available:
-        st.info("No hay tickers después de los filtros.")
+    # Validación defensiva
+    if df_list is None or df_list.empty:
+        st.info(
+            "No hay empresas que pasen todos los filtros (calidad financiera, "
+            "crecimiento operativo, deuda sana). "
+            "Prueba relajar umbrales o verifica que la API esté devolviendo datos."
+        )
     else:
-        picked = st.selectbox("Elige un ticker:", tickers_available)
-        # buscar snapshot correspondiente
-        snap = next((s for s in snaps if s.get("ticker") == picked), None)
+        # ahora sí sabemos que df_list tiene columnas
+        tickers_available = df_list["ticker"].dropna().unique().tolist()
 
-        if snap is None:
-            st.warning("No encontré el snapshot de ese ticker.")
+        if not tickers_available:
+            st.info(
+                "No hay tickers disponibles en este momento, "
+                "aunque el screener tiene filas sin ticker válido."
+            )
         else:
-            detail = build_detail_view(snap)
+            picked = st.selectbox("Elige un ticker:", tickers_available)
 
-            for section, block in detail.items():
-                st.markdown(f"### {section}")
-                for k, v in block.items():
-                    st.write(f"**{k}:** {v}")
-                st.markdown("---")
+            snap = next((s for s in snaps if s.get("ticker") == picked), None)
+
+            if snap is None:
+                st.warning(
+                    "No encontré el snapshot detallado de ese ticker. "
+                    "Puede que fallara la descarga de fundamentales o texto."
+                )
+            else:
+                detail = build_detail_view(snap)
+
+                for section, block in detail.items():
+                    st.markdown(f"### {section}")
+                    for k, v in block.items():
+                        st.write(f"**{k}:** {v}")
+                    st.markdown("---")

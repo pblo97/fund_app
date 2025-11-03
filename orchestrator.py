@@ -92,7 +92,7 @@ def pipeline_run() -> Dict[str, Any]:
         "snapshots_final": snapshots_final,
     }
 
-def build_list_view_df(snapshots: List[dict]) -> pd.DataFrame:
+def build_list_view_df(snapshots: List[Dict]) -> pd.DataFrame:
     rows = []
     for s in snapshots:
         rows.append({
@@ -109,9 +109,36 @@ def build_list_view_df(snapshots: List[dict]) -> pd.DataFrame:
             "expected_return_cagr": s.get("expected_return_cagr"),
             "core_risk_note": s.get("core_risk_note"),
         })
+
+    # Si no hay rows, devolvemos DF vacío PERO con las columnas definidas
+    if not rows:
+        df = pd.DataFrame(
+            columns=[
+                "ticker",
+                "companyName",
+                "sector",
+                "industry",
+                "marketCap",
+                "altmanZScore",
+                "piotroskiScore",
+                "high_growth_flag",
+                "is_quality_compounder",
+                "net_debt_to_ebitda_last",
+                "expected_return_cagr",
+                "core_risk_note",
+            ]
+        )
+        return df
+
     df = pd.DataFrame(rows)
-    # Ordenar por expected_return_cagr descendente (mejores primero)
+
+    # Ordenar por expected_return_cagr descendente si esa col existe
     if "expected_return_cagr" in df.columns:
-        df = df.sort_values("expected_return_cagr", ascending=False)
+        try:
+            df = df.sort_values("expected_return_cagr", ascending=False)
+        except Exception:
+            # si hay None mezclados no pasa nada, dejamos sin ordenar
+            pass
+
     return df.reset_index(drop=True)
 
